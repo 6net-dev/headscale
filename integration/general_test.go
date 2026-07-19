@@ -364,6 +364,57 @@ func TestPingAllByHostname(t *testing.T) {
 	assertPingAll(t, allClients, allHostnames)
 }
 
+// TestPingAllByIPv6Only runs headscale with no IPv4 prefix configured,
+// verifying that a v6-only tailnet allocates exactly one ULA address per
+// node and that clients reach each other by IPv6 address and by MagicDNS
+// hostname without holding a self IPv4 address.
+func TestPingAllByIPv6Only(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: 2,
+		Users:        []string{"user1", "user2"},
+	}
+
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{},
+		hsic.WithTestName("pingv6only"),
+		hsic.WithConfigEnv(map[string]string{
+			"HEADSCALE_PREFIXES_V4": "",
+		}),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	allIps, err := scenario.ListTailscaleClientsIPs()
+	requireNoErrListClientIPs(t, err)
+
+	require.Len(t, allIps, len(allClients))
+	for _, ip := range allIps {
+		require.Truef(t, ip.Is6(), "v6-only tailnet allocated non-IPv6 address: %s", ip)
+	}
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	assertPingAll(t, allClients, allAddrs)
+
+	allHostnames, err := scenario.ListTailscaleClientsFQDNs()
+	requireNoErrListFQDN(t, err)
+
+	assertPingAll(t, allClients, allHostnames)
+}
+
 // If subtests are parallel, then they will start before setup is run.
 // This might mean we approach setup slightly wrong, but for now, ignore
 // the linter

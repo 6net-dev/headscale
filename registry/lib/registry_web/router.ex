@@ -11,6 +11,7 @@ defmodule RegistrarWeb.Router do
     get "/world/:node_key", WorldController, :show
     post "/devices", DeviceController, :create
     put "/devices/:node_key/grants/:org", GrantController, :update
+    post "/devices/:node_key/grants", AdmissionController, :create
   end
 
   # SSE: no :accepts pipeline — the stream negotiates its own

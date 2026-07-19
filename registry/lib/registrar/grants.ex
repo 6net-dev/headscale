@@ -35,6 +35,27 @@ defmodule Registrar.Grants do
     end
   end
 
+  def admit_by(node_key, org_slug, identity, opts \\ []) do
+    device = Registrar.Devices.get_device_by_node_key(node_key)
+    org = Registrar.Orgs.get_org_by_slug(org_slug)
+
+    cond do
+      is_nil(device) ->
+        {:error, :unknown_device}
+
+      is_nil(org) ->
+        {:error, :unknown_org}
+
+      not is_nil(Repo.get_by(Grant, device_id: device.id, org_id: org.id)) ->
+        {:error, :already_admitted}
+
+      true ->
+        with {:ok, grant} <- admit(device, org, identity, opts) do
+          {:ok, %{grant | org: org, device: device}}
+        end
+    end
+  end
+
   def admit(device, org, identity, opts \\ []) do
     Repo.transaction(fn ->
       next =

@@ -13,6 +13,8 @@ defmodule RegistrarWeb.Router do
     put "/devices/:node_key/grants/:org", GrantController, :update
     get "/devices/:node_key/grants", GrantController, :index
     post "/devices/:node_key/grants", AdmissionController, :create
+    post "/orgs/:slug/invites", InviteController, :create
+    post "/invites/:token/redeem", InviteController, :redeem
   end
 
   # SSE: no :accepts pipeline — the stream negotiates its own

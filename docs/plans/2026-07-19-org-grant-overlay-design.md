@@ -171,12 +171,24 @@ recording, audit logs, app connectors, `OldNodeKey` rotation
   the composite (registry + wire head), keeping stock-client
   compatibility continuously proven. `hscontrol/servertest` covers
   head-only tests.
+- **Wire head, option B (declared v2 path):** upstream `tailscale-rs`
+  (`ts_control` crate) via Rustler could move the protocol machinery
+  *inside* the BEAM — one deployable instead of two. Deferred until
+  the `World(device)` contract is stable and tailscale-rs matures
+  (today the harness builds its example node with a patched feature
+  flag); long-lived Noise streams belong on Rustler-supervised native
+  threads, not naive NIFs. `tsric` stays in the test matrix so
+  tailscale-rs compatibility is continuously measured. The contract
+  makes Go-service → Rust-in-BEAM a swap, not a rewrite.
 
 ## 9. V1 scope and order
 
 1. **Spikes (gating, ~an afternoon in the harness):**
    a. Stock client applies *multiple IPv6 self-addresses* from one
-      netmap (gates the addressing design).
+      netmap (gates the addressing design). **PROVEN 2026-07-19** —
+      `TestMultiIPv6AddressSpike` on branch `spike/multi-v6-address`:
+      every node took two addresses in different /56s and answered
+      pings on both.
    b. Per-org search domains compose past 2–3 orgs.
    c. Toggle churn: full netmap replace on activation feels instant.
 2. **M1 — the heart:** org + grant schema in Postgres; composition

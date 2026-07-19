@@ -601,6 +601,10 @@ func (h *Headscale) Serve() error {
 
 	go h.scheduledTasks(scheduleCtx)
 
+	if h.cfg.RegistryURL != "" {
+		go h.registryChangeListener(scheduleCtx)
+	}
+
 	// Prepare group for running listeners
 	errorGroup := new(errgroup.Group)
 

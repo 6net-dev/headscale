@@ -200,3 +200,43 @@ func (c *Client) SetActive(ctx context.Context, nodeKey, org string, active bool
 
 	return nil
 }
+
+// RedeemInvite presents an invite token, admitting this device to the
+// invite's org with an active grant.
+func (c *Client) RedeemInvite(ctx context.Context, token, nodeKey string) (string, error) {
+	body, err := json.Marshal(map[string]string{"node_key": nodeKey})
+	if err != nil {
+		return "", err
+	}
+
+	u := c.baseURL + "/api/invites/" + url.PathEscape(token) + "/redeem"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Org     string `json:"org"`
+		Address string `json:"address"`
+		Error   string `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("registry: decoding redemption: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("registry: invite redemption failed: %s", out.Error)
+	}
+
+	return out.Org + " → " + out.Address, nil
+}

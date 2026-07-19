@@ -255,6 +255,19 @@ func main() {
 		}
 	}
 
+	// `tui redeem <token>` — join an org by invite link, then exit.
+	if args := flag.Args(); len(args) == 2 && args[0] == "redeem" {
+		result, err := registryclient.New(*registryURL).RedeemInvite(ctx, args[1], nodeKey)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		fmt.Println("joined " + result)
+
+		return
+	}
+
 	m := model{
 		reg:     registryclient.New(*registryURL),
 		nodeKey: nodeKey,

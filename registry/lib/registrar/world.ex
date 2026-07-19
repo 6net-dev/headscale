@@ -13,7 +13,7 @@ defmodule Registrar.World do
 
   alias Registrar.{Grants, Net}
 
-  @version 0
+  @version 1
 
   def for_device(%{id: device_id}), do: for_device(device_id)
 
@@ -32,7 +32,8 @@ defmodule Registrar.World do
           name: first.device.name,
           node_key: first.device.node_key,
           addresses: Enum.map(shared_grants, &address/1),
-          orgs: Enum.map(shared_grants, & &1.org.slug)
+          orgs: Enum.map(shared_grants, & &1.org.slug),
+          entries: Enum.map(shared_grants, &entry/1)
         }
       end)
       |> Enum.sort_by(& &1.name)
@@ -40,11 +41,14 @@ defmodule Registrar.World do
     %{
       version: @version,
       self: %{
+        name: self_name(mine),
         addresses: Enum.map(mine, &address/1),
-        orgs: Enum.map(mine, & &1.org.slug)
+        orgs: Enum.map(mine, & &1.org.slug),
+        entries: Enum.map(mine, &entry/1)
       },
       peers: peers,
       dns: %{
+        base_domain: base_domain(),
         search_domains: Enum.map(mine, &"#{&1.org.slug}.#{base_domain()}")
       },
       filters:
@@ -59,6 +63,19 @@ defmodule Registrar.World do
     {:ok, addr} = Net.device_address(grant.org.prefix_index, grant.host_index)
     addr
   end
+
+  # One (org, address, fqdn) triple per grant — a device is named
+  # separately inside each org it participates in.
+  defp entry(grant) do
+    %{
+      org: grant.org.slug,
+      address: address(grant),
+      fqdn: "#{grant.device.name}.#{grant.org.slug}.#{base_domain()}"
+    }
+  end
+
+  defp self_name([]), do: nil
+  defp self_name([first | _]), do: first.device.name
 
   defp base_domain, do: Application.get_env(:registry, :base_domain, "overlay.internal")
 end

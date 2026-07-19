@@ -88,4 +88,20 @@ defmodule Registrar.WorldTest do
     assert Enum.sort(world.dns.search_domains) ==
              ["acme.overlay.internal", "personal.overlay.internal"]
   end
+
+  test "v1 entries carry org-scoped fqdns", %{mac: mac} do
+    world = World.for_device(mac)
+
+    assert world.version == 1
+    assert world.self.name == "mac"
+
+    fqdns = Enum.map(world.self.entries, & &1.fqdn) |> Enum.sort()
+    assert fqdns == ["mac.acme.overlay.internal", "mac.personal.overlay.internal"]
+
+    assert world.dns.base_domain == "overlay.internal"
+
+    [core7_peer] = Enum.filter(world.peers, &(&1.name == "core7"))
+    assert [%{org: "personal", fqdn: "core7.personal.overlay.internal"}] =
+             Enum.map(core7_peer.entries, &Map.take(&1, [:org, :fqdn]))
+  end
 end

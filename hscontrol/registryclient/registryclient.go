@@ -28,18 +28,30 @@ type World struct {
 }
 
 type WorldSelf struct {
-	Addresses []string `json:"addresses"`
-	Orgs      []string `json:"orgs"`
+	Name      string       `json:"name"`
+	Addresses []string     `json:"addresses"`
+	Orgs      []string     `json:"orgs"`
+	Entries   []WorldEntry `json:"entries"`
+}
+
+// WorldEntry is one (org, address, fqdn) triple — a device is named
+// separately inside each org it participates in.
+type WorldEntry struct {
+	Org     string `json:"org"`
+	Address string `json:"address"`
+	FQDN    string `json:"fqdn"`
 }
 
 type Peer struct {
-	Name      string   `json:"name"`
-	NodeKey   string   `json:"node_key"`
-	Addresses []string `json:"addresses"`
-	Orgs      []string `json:"orgs"`
+	Name      string       `json:"name"`
+	NodeKey   string       `json:"node_key"`
+	Addresses []string     `json:"addresses"`
+	Orgs      []string     `json:"orgs"`
+	Entries   []WorldEntry `json:"entries"`
 }
 
 type WorldDNS struct {
+	BaseDomain    string   `json:"base_domain"`
 	SearchDomains []string `json:"search_domains"`
 }
 

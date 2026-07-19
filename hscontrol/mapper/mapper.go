@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
@@ -54,6 +55,11 @@ type mapper struct {
 	// [mapper.rewriteFromRegistry].
 	regClient *registryclient.Client
 
+	// worldCache holds the last world seen per node so registry
+	// outages degrade to stale-but-sealed netmaps (fail-closed).
+	worldCache   map[types.NodeID]*registryclient.World
+	worldCacheMu sync.Mutex
+
 	created time.Time
 }
 
@@ -77,6 +83,7 @@ func newMapper(
 
 	if cfg.RegistryURL != "" {
 		m.regClient = registryclient.New(cfg.RegistryURL)
+		m.worldCache = make(map[types.NodeID]*registryclient.World)
 	}
 
 	return m

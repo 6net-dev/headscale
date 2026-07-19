@@ -11,6 +11,7 @@ defmodule RegistrarWeb.Router do
     get "/world/:node_key", WorldController, :show
     post "/devices", DeviceController, :create
     put "/devices/:node_key/grants/:org", GrantController, :update
+    get "/devices/:node_key/grants", GrantController, :index
     post "/devices/:node_key/grants", AdmissionController, :create
   end
 

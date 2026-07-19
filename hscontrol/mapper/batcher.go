@@ -154,7 +154,9 @@ func generateMapResponse(nc nodeConnection, mapper *mapper, r change.Change) (*t
 		}
 	}
 
-	mapper.rewriteFromRegistry(nc.nodeID(), mapResp)
+	if err := mapper.rewriteFromRegistry(nc.nodeID(), mapResp); err != nil {
+		return nil, fmt.Errorf("registry rewrite: %w", err)
+	}
 
 	return mapResp, nil
 }

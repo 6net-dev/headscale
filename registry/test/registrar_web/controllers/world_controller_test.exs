@@ -16,7 +16,7 @@ defmodule RegistrarWeb.WorldControllerTest do
     conn = get(conn, ~p"/api/world/#{"nk:mac"}")
 
     assert %{
-             "version" => 0,
+             "version" => 1,
              "self" => %{"addresses" => [addr], "orgs" => ["personal"]},
              "peers" => [%{"name" => "core7", "node_key" => "nk:core7"}],
              "dns" => %{"search_domains" => ["personal.overlay.internal"]}

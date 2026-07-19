@@ -54,8 +54,14 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 		applyWorldAddresses(resp.Node, world.Self.Addresses)
 	}
 
-	resp.Peers = rewriteWorldPeers(resp.Peers, byKey)
-	resp.PeersChanged = rewriteWorldPeers(resp.PeersChanged, byKey)
+	// Peers dropped by the rewrite must be announced in PeersRemoved:
+	// an empty Peers list is omitted on the wire and means "no
+	// change", so silence would leave stale peers on the client.
+	var removed []tailcfg.NodeID
+
+	resp.Peers, removed = rewriteWorldPeers(resp.Peers, byKey, removed)
+	resp.PeersChanged, removed = rewriteWorldPeers(resp.PeersChanged, byKey, removed)
+	resp.PeersRemoved = append(resp.PeersRemoved, removed...)
 
 	if len(resp.PeersChangedPatch) > 0 {
 		kept := resp.PeersChangedPatch[:0]
@@ -75,15 +81,16 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 	}
 }
 
-// rewriteWorldPeers drops peers the world does not contain and rewrites
-// the addresses of those it does. A nil slice stays nil — deltas rely
-// on the nil/empty distinction.
+// rewriteWorldPeers drops peers the world does not contain (recording
+// them in removed) and rewrites the addresses of those it does. A nil
+// slice stays nil — deltas rely on the nil/empty distinction.
 func rewriteWorldPeers(
 	peers []*tailcfg.Node,
 	byKey map[string]registryclient.Peer,
-) []*tailcfg.Node {
+	removed []tailcfg.NodeID,
+) ([]*tailcfg.Node, []tailcfg.NodeID) {
 	if peers == nil {
-		return nil
+		return nil, removed
 	}
 
 	kept := peers[:0]
@@ -91,6 +98,7 @@ func rewriteWorldPeers(
 	for _, peer := range peers {
 		worldPeer, ok := byKey[peer.Key.String()]
 		if !ok {
+			removed = append(removed, peer.ID)
 			continue
 		}
 
@@ -98,7 +106,7 @@ func rewriteWorldPeers(
 		kept = append(kept, peer)
 	}
 
-	return kept
+	return kept, removed
 }
 
 // applyWorldAddresses replaces a node's self addresses while preserving

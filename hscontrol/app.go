@@ -691,6 +691,10 @@ func (h *Headscale) Serve() error {
 		zerolog.RespLog = false
 	}
 
+	if h.cfg.RegistryURL != "" {
+		go h.registryChangeListener(scheduleCtx)
+	}
+
 	// Prepare group for running listeners
 	errorGroup := new(errgroup.Group)
 

@@ -154,6 +154,8 @@ func generateMapResponse(nc nodeConnection, mapper *mapper, r change.Change) (*t
 		}
 	}
 
+	mapper.rewriteFromRegistry(nc.nodeID(), mapResp)
+
 	return mapResp, nil
 }
 

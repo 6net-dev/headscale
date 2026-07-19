@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/registryclient"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -48,6 +49,11 @@ type mapper struct {
 	cfg     *types.Config
 	batcher *Batcher
 
+	// regClient, when non-nil, makes the external registry
+	// authoritative for topology and addressing via
+	// [mapper.rewriteFromRegistry].
+	regClient *registryclient.Client
+
 	created time.Time
 }
 
@@ -62,12 +68,18 @@ func newMapper(
 	state *state.State,
 ) *mapper {
 	// uid, _ := util.GenerateRandomStringDNSSafe(mapperIDLength)
-	return &mapper{
+	m := &mapper{
 		state: state,
 		cfg:   cfg,
 
 		created: time.Now(),
 	}
+
+	if cfg.RegistryURL != "" {
+		m.regClient = registryclient.New(cfg.RegistryURL)
+	}
+
+	return m
 }
 
 // generateUserProfiles creates user profiles for [tailcfg.MapResponse].

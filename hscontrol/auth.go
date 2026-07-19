@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/registryclient"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
@@ -458,6 +459,8 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	// Send both changes. Empty changes are ignored by Change().
 	h.Change(changed, routesChange)
 
+	h.notifyRegistryDeviceRegistered(node)
+
 	resp := &tailcfg.RegisterResponse{
 		MachineAuthorized: true,
 		NodeKeyExpired:    node.IsExpired(),
@@ -507,4 +510,26 @@ func (h *Headscale) handleRegisterInteractive(
 	return &tailcfg.RegisterResponse{
 		AuthURL: h.authProvider.RegisterURL(authID),
 	}, nil
+}
+
+// notifyRegistryDeviceRegistered reports a committed registration to
+// the external registry, when one is configured. Fire-and-forget: a
+// slow or absent registry must never block a client's registration
+// response.
+func (h *Headscale) notifyRegistryDeviceRegistered(node types.NodeView) {
+	if h.cfg.RegistryURL == "" || !node.Valid() {
+		return
+	}
+
+	name := node.Hostname()
+	nodeKey := node.NodeKey().String()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := registryclient.New(h.cfg.RegistryURL).UpsertDevice(ctx, name, nodeKey); err != nil {
+			log.Warn().Err(err).Str("node", name).Msg("registry device upsert failed")
+		}
+	}()
 }

@@ -9,5 +9,6 @@ defmodule RegistrarWeb.Router do
     pipe_through :api
 
     get "/world/:node_key", WorldController, :show
+    post "/devices", DeviceController, :create
   end
 end

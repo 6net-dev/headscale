@@ -35,6 +35,24 @@ defmodule Registrar.Grants do
     end
   end
 
+  def list_for(node_key) do
+    case Registrar.Devices.get_device_by_node_key(node_key) do
+      nil ->
+        {:error, :unknown_device}
+
+      device ->
+        grants =
+          Repo.all(
+            from g in Grant,
+              where: g.device_id == ^device.id,
+              preload: [:org],
+              order_by: g.id
+          )
+
+        {:ok, device, grants}
+    end
+  end
+
   def admit_by(node_key, org_slug, identity, opts \\ []) do
     device = Registrar.Devices.get_device_by_node_key(node_key)
     org = Registrar.Orgs.get_org_by_slug(org_slug)

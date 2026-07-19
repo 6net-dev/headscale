@@ -12,6 +12,29 @@ defmodule Registrar.Grants do
   alias Registrar.Grants.Grant
   alias Registrar.Repo
 
+  @world_changes_topic "world_changes"
+
+  def world_changes_topic, do: @world_changes_topic
+
+  def set_active_by(node_key, org_slug, active) when is_boolean(active) do
+    device = Registrar.Devices.get_device_by_node_key(node_key)
+    org = Registrar.Orgs.get_org_by_slug(org_slug)
+
+    cond do
+      is_nil(device) ->
+        {:error, :unknown_device}
+
+      is_nil(org) ->
+        {:error, :unknown_org}
+
+      true ->
+        case Repo.get_by(Grant, device_id: device.id, org_id: org.id) do
+          nil -> {:error, :no_grant}
+          grant -> set_active(grant, active)
+        end
+    end
+  end
+
   def admit(device, org, identity, opts \\ []) do
     Repo.transaction(fn ->
       next =
@@ -34,6 +57,10 @@ defmodule Registrar.Grants do
         {:error, changeset} -> Repo.rollback(changeset)
       end
     end)
+    |> tap(fn
+      {:ok, _grant} -> broadcast_world_change(org.id)
+      _ -> :ok
+    end)
   end
 
   def activate(%Grant{} = grant), do: set_active(grant, true)
@@ -41,8 +68,14 @@ defmodule Registrar.Grants do
   def deactivate(%Grant{} = grant), do: set_active(grant, false)
 
   def revoke_all(device, org) do
+    # Compute the audience before deleting so the revoked device still
+    # hears about its own removal.
+    keys = org_node_keys(org.id)
+
     {count, _} =
       Repo.delete_all(from g in Grant, where: g.device_id == ^device.id and g.org_id == ^org.id)
+
+    broadcast(keys)
 
     {:ok, count}
   end
@@ -58,5 +91,34 @@ defmodule Registrar.Grants do
     grant
     |> Ecto.Changeset.change(active: active)
     |> Repo.update()
+    |> tap(fn
+      {:ok, updated} -> broadcast_world_change(updated.org_id)
+      _ -> :ok
+    end)
+  end
+
+  # Conservative audience: every device holding a grant (any state) in
+  # the changed org. Over-notifying is harmless — the wire head
+  # re-fetches worlds; under-notifying strands stale netmaps.
+  defp broadcast_world_change(org_id), do: org_id |> org_node_keys() |> broadcast()
+
+  defp org_node_keys(org_id) do
+    Repo.all(
+      from g in Grant,
+        join: d in assoc(g, :device),
+        where: g.org_id == ^org_id,
+        distinct: true,
+        select: d.node_key
+    )
+  end
+
+  defp broadcast([]), do: :ok
+
+  defp broadcast(node_keys) do
+    Phoenix.PubSub.broadcast(
+      Registrar.PubSub,
+      @world_changes_topic,
+      {:world_changed, node_keys}
+    )
   end
 end

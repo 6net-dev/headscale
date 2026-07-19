@@ -122,3 +122,81 @@ func (c *Client) UpsertDevice(ctx context.Context, name, nodeKey string) error {
 
 	return nil
 }
+
+// Grant is one org membership as reported by the registry's grants
+// listing. Inactive grants still hold their address slot.
+type Grant struct {
+	Org                string  `json:"org"`
+	OrgName            string  `json:"org_name"`
+	Identity           string  `json:"identity"`
+	Active             bool    `json:"active"`
+	Address            string  `json:"address"`
+	AdmissionExpiresAt *string `json:"admission_expires_at"`
+}
+
+type DeviceGrants struct {
+	Device struct {
+		Name    string `json:"name"`
+		NodeKey string `json:"node_key"`
+	} `json:"device"`
+	Grants []Grant `json:"grants"`
+}
+
+// Grants lists a device's grants, active and inactive.
+func (c *Client) Grants(ctx context.Context, nodeKey string) (*DeviceGrants, error) {
+	u := c.baseURL + "/api/devices/" + url.PathEscape(nodeKey) + "/grants"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var dg DeviceGrants
+		if err := json.NewDecoder(resp.Body).Decode(&dg); err != nil {
+			return nil, fmt.Errorf("registry: decoding grants: %w", err)
+		}
+
+		return &dg, nil
+	case http.StatusNotFound:
+		return nil, ErrUnknownDevice
+	default:
+		return nil, fmt.Errorf("registry: grants request returned %d", resp.StatusCode)
+	}
+}
+
+// SetActive toggles a grant's activation — the six o'clock switch.
+func (c *Client) SetActive(ctx context.Context, nodeKey, org string, active bool) error {
+	body, err := json.Marshal(map[string]bool{"active": active})
+	if err != nil {
+		return err
+	}
+
+	u := c.baseURL + "/api/devices/" + url.PathEscape(nodeKey) + "/grants/" + url.PathEscape(org)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("registry: toggle returned %d", resp.StatusCode)
+	}
+
+	return nil
+}

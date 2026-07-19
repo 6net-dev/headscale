@@ -114,6 +114,11 @@ type Config struct {
 	PreAuthKeys         PreAuthKeysConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
+
+	// RegistryURL, when set, makes the external registry authoritative
+	// for topology and addressing: netmaps are rewritten from its
+	// World(device) contract and registrations are reported to it.
+	RegistryURL string
 	IPAllocation        IPAllocationStrategy
 	NoisePrivateKeyPath string
 	BaseDomain          string
@@ -1223,6 +1228,7 @@ func LoadServerConfig() (*Config, error) {
 
 		PrefixV4:     prefix4,
 		PrefixV6:     prefix6,
+		RegistryURL:  viper.GetString("registry.url"),
 		IPAllocation: alloc,
 
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(

@@ -1,6 +1,8 @@
 > **This is the 6net wire head — a hard fork of headscale, not headscale
 > itself.**
 >
+> [![6net CI](https://github.com/6net-dev/headscale/actions/workflows/6net.yml/badge.svg)](https://github.com/6net-dev/headscale/actions/workflows/6net.yml)
+>
 > It keeps headscale's transport (Noise handshake, netmap rendering,
 > DERP) and takes its truth from the [6net
 > registry](https://github.com/6net-dev/6net): every outbound netmap is

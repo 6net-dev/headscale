@@ -1,3 +1,19 @@
+> **This is the 6net wire head — a hard fork of headscale, not headscale
+> itself.**
+>
+> It keeps headscale's transport (Noise handshake, netmap rendering,
+> DERP) and takes its truth from the [6net
+> registry](https://github.com/6net-dev/6net): every outbound netmap is
+> rewritten from a `World(device)` contract that decides which
+> organizations a device belongs to, what addresses it holds, and which
+> peers it may see. Run `headscale` unconfigured for a registry and it
+> behaves as upstream does.
+>
+> Issues and pull requests here are for the fork. Upstream headscale
+> lives at [juanfont/headscale](https://github.com/juanfont/headscale)
+> and is tracked as the `upstream` remote; please report upstream bugs
+> there.
+
 ![headscale logo](./docs/assets/logo/headscale3_header_stacked_left.png)
 
 ![ci](https://github.com/juanfont/headscale/actions/workflows/test.yml/badge.svg)

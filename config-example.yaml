@@ -46,6 +46,22 @@ grpc_allow_insecure: false
 # source IP.
 trusted_proxies: []
 
+# The 6net registry. When `url` is set, the registry becomes
+# authoritative for topology and addressing: every outbound netmap is
+# rewritten from its World(device) contract — addresses, peers, names,
+# DNS, and packet filters — and node registrations are reported to it.
+# The `prefixes` and `dns` settings below no longer decide what a node
+# is given; the registry does.
+#
+# If the registry is unreachable, the last known world for that node is
+# served instead, and a node with no cached world gets no response at
+# all. Stale-but-sealed beats fresh-but-leaky.
+#
+# Leave this unset to run as upstream headscale does.
+#
+# registry:
+#   url: http://127.0.0.1:4000
+
 # The Noise section includes specific configuration for the
 # TS2021 Noise protocol
 noise:

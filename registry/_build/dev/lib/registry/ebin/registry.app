@@ -1,1 +1,0 @@
-{application,registry,[{modules,[]},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger,runtime_tools,phoenix,phoenix_ecto,ecto_sql,postgrex,telemetry_metrics,telemetry_poller,jason,dns_cluster,bandit]},{description,"registry"},{registered,[]},{vsn,"0.1.0"},{mod,{'Elixir.Registrar.Application',[]}}]}.

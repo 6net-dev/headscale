@@ -46,12 +46,20 @@ type fakeWorlds struct {
 	// slow is how long a call takes, so one fetch can be made to eat into
 	// whatever budget the next one is given.
 	slow map[string]time.Duration
+
+	// inFlight and peak are how many calls were running at once, which is
+	// what says whether a sweep is a pool or a queue of one.
+	inFlight int
+	peak     int
 }
 
 func (f *fakeWorlds) World(ctx context.Context, headNodeID string) (*registry.World, error) {
 	f.mu.Lock()
 
 	f.calls[headNodeID]++
+
+	f.inFlight++
+	f.peak = max(f.peak, f.inFlight)
 
 	if deadline, ok := ctx.Deadline(); ok {
 		f.budgets[headNodeID] = time.Until(deadline)
@@ -67,6 +75,8 @@ func (f *fakeWorlds) World(ctx context.Context, headNodeID string) (*registry.Wo
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	f.inFlight--
 
 	if err, ok := f.errs[headNodeID]; ok {
 		return nil, err
@@ -85,6 +95,27 @@ func (f *fakeWorlds) budgetFor(headNodeID string) time.Duration {
 	defer f.mu.Unlock()
 
 	return f.budgets[headNodeID]
+}
+
+// peakInFlight is the most calls this store ever had running at once.
+func (f *fakeWorlds) peakInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.peak
+}
+
+// totalCalls is every call the store answered, however it answered it.
+func (f *fakeWorlds) totalCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	total := 0
+	for _, calls := range f.calls {
+		total += calls
+	}
+
+	return total
 }
 
 func (f *fakeWorlds) callsFor(headNodeID string) int {

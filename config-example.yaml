@@ -69,6 +69,12 @@ trusted_proxies: []
 # registry serve the netmaps it last rendered instead of serving nothing.
 # It defaults to /var/lib/headscale/registry-cache.json.
 #
+# `refresh_timeout` caps the sweep that re-reads every cached world when the
+# change stream (re)connects. No change is served until that sweep is done, so
+# this is the longest a reconnect may leave the head deaf; a world the sweep
+# did not reach is simply read again the next time a netmap needs it. It
+# defaults to 30s.
+#
 # `dns.base_domain` below MUST equal the registry's OVERLAY_BASE_DOMAIN — it
 # is the domain the rendered world's names are composed under, and a head
 # that disagrees composes hostnames no peer answers to.
@@ -79,6 +85,7 @@ trusted_proxies: []
 #   url: http://127.0.0.1:4000
 #   bearer_path: /run/secrets/registry-bearer
 #   cache_path: /var/lib/headscale/registry-cache.json
+#   refresh_timeout: 30s
 
 # The Noise section includes specific configuration for the
 # TS2021 Noise protocol

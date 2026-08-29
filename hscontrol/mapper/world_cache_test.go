@@ -2,6 +2,10 @@ package mapper
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,4 +165,165 @@ func TestTheWorldCacheIsInertWithoutARegistry(t *testing.T) {
 		b.InvalidateWorld(types.NodeID(1))
 	})
 	assert.Nil(t, b.SnapshotWorlds())
+}
+
+// # The sweep is bounded in both directions
+//
+// A reconnect refreshes every cached World before a single event is served,
+// which on a large installation is thousands of documents. Serially, at one
+// per-peer timeout each, an unreachable Gentility would hold the stream's
+// Connected callback — and therefore the stream — for hours. So the sweep
+// reads several at once and gives up on the whole of it at a deadline.
+
+// TestRefreshWorldsReadsInParallel: the pool is what makes a big sweep finish.
+func TestRefreshWorldsReadsInParallel(t *testing.T) {
+	const nodes = 32
+
+	store := newFakeWorlds(map[string]*registry.World{})
+
+	m := newTestMapper(store)
+	for id := range nodes {
+		key := registry.NodeID(uint64(id + 1))
+		store.worlds[key] = world(key, "acme", "n", []string{selfAddr})
+		store.slow[key] = 20 * time.Millisecond
+
+		m.cacheWorld(types.NodeID(id+1), store.worlds[key])
+	}
+
+	m.refreshWorlds(t.Context())
+
+	assert.Equal(t, worldRefreshWorkers, store.peakInFlight(),
+		"the sweep reads exactly the pool's worth at a time")
+
+	for id := range nodes {
+		_, fresh := m.cachedWorld(types.NodeID(id + 1))
+		assert.True(t, fresh, "node %d should be refreshed", id+1)
+	}
+}
+
+// TestRefreshWorldsGivesUpAtItsDeadline: a Gentility that answers, but far too
+// slowly to sweep in a reasonable time, must not hold the change stream. The
+// sweep returns at its deadline with whatever it managed.
+func TestRefreshWorldsGivesUpAtItsDeadline(t *testing.T) {
+	const nodes = 200
+
+	store := newFakeWorlds(map[string]*registry.World{})
+
+	m := newTestMapper(store)
+	m.worldRefreshTimeout = 150 * time.Millisecond
+
+	for id := range nodes {
+		key := registry.NodeID(uint64(id + 1))
+		store.worlds[key] = world(key, "acme", "n", []string{selfAddr})
+		store.slow[key] = 50 * time.Millisecond
+
+		m.cacheWorld(types.NodeID(id+1), store.worlds[key])
+	}
+
+	// Serially this is ten seconds, and eight at a time is still more than
+	// a second: the deadline is what bounds it, not the pool.
+	started := time.Now()
+	m.refreshWorlds(t.Context())
+	elapsed := time.Since(started)
+
+	assert.Less(t, elapsed, time.Second, "the sweep must return at its deadline")
+	assert.Less(t, store.totalCalls(), nodes, "the sweep is expected to run out of time")
+
+	// A node the sweep never reached is UNREFRESHED, not refreshed-and-
+	// unchanged: the next map build that names it reads it on demand. That
+	// is the whole of what "not reached" may mean, and stamping it would
+	// quietly hand out a document cached over a connection that dropped.
+	unreached := 0
+
+	for id := range nodes {
+		if _, fresh := m.cachedWorld(types.NodeID(id + 1)); !fresh {
+			unreached++
+		}
+	}
+
+	assert.Positive(t, unreached, "the nodes the sweep never reached stay unrefreshed")
+}
+
+// TestRefreshWorldsStopsWhenTheStreamDoes: the sweep runs on the stream's
+// context, so a head shutting down does not wait it out.
+func TestRefreshWorldsStopsWhenTheStreamDoes(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{})
+
+	m := newTestMapper(store)
+
+	for id := range 100 {
+		key := registry.NodeID(uint64(id + 1))
+		store.worlds[key] = world(key, "acme", "n", []string{selfAddr})
+		store.slow[key] = 50 * time.Millisecond
+
+		m.cacheWorld(types.NodeID(id+1), store.worlds[key])
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	started := time.Now()
+	m.refreshWorlds(ctx)
+
+	assert.Less(t, time.Since(started), time.Second)
+}
+
+// TestRefreshWorldsDoesNotHoldTheChangeStream is the sweep in the place it
+// actually runs: inside [registry.ChangeHandler.Connected], which the client
+// calls before it reads a single line. A Gentility answering World after World
+// too slowly to sweep must not stop the head hearing about changes — the
+// unswept documents are read on demand, and the news arrives on time.
+func TestRefreshWorldsDoesNotHoldTheChangeStream(t *testing.T) {
+	const nodes = 200
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/overlay/head/world/", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"renderer_version":1,"revision":1,"head_node_id":%q,"base_domain":%q}`,
+			strings.TrimPrefix(r.URL.Path, "/overlay/head/world/"), baseDomain)
+	})
+	mux.HandleFunc("/overlay/head/changes", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "id: 1\ndata: {\"seq\":1,\"head_node_id\":\"1\",\"world_revision\":2}\n\n")
+
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	})
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := registry.New(server.URL, "secret")
+
+	m := newTestMapper(client)
+	m.worldRefreshTimeout = 200 * time.Millisecond
+
+	for id := range nodes {
+		key := registry.NodeID(uint64(id + 1))
+		m.cacheWorld(types.NodeID(id+1), world(key, "acme", "n", []string{selfAddr}))
+	}
+
+	var delivered []registry.Change
+
+	// Ten seconds of Worlds, one connection, one event waiting behind them.
+	started := time.Now()
+	err := client.Changes(t.Context(), nil, registry.ChangeHandler{
+		Connected: func() { m.refreshWorlds(t.Context()) },
+		Changed:   func(c registry.Change) { delivered = append(delivered, c) },
+	})
+	require.NoError(t, err)
+
+	assert.Less(t, time.Since(started), 3*time.Second,
+		"the sweep must not hold the stream for as long as the sweep would take")
+
+	require.Len(t, delivered, 1, "the stream is read once the sweep gives up")
+	assert.Equal(t, int64(1), delivered[0].Seq)
 }

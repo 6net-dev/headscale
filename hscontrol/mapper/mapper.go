@@ -72,6 +72,11 @@ type mapper struct {
 	worldTTL time.Duration
 	now      func() time.Time
 
+	// worldRefreshTimeout caps the whole reconnect sweep. See
+	// [mapper.refreshWorlds]: it is the longest a reconnect may leave the
+	// change stream unserved.
+	worldRefreshTimeout time.Duration
+
 	// worldGen is the ready gate: the connection to Gentility a cached
 	// World was last read for. An entry from an earlier generation is
 	// never served as it stands. See [mapper.beginWorldRefresh].
@@ -114,6 +119,7 @@ func newMapper(
 		m.regClient = registry.New(cfg.RegistryURL, cfg.RegistryBearer)
 		m.worldCache = make(map[types.NodeID]cachedWorld)
 		m.worldTTL = defaultWorldTTL
+		m.worldRefreshTimeout = cfg.RegistryRefreshTimeout
 		m.now = time.Now
 
 		// One, not zero: a World loaded off the disk is stamped with

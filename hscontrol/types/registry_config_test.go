@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -137,25 +138,25 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("no registry at all", func(t *testing.T) {
 		withViper(t, nil)
 
-		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
+		got, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
-		assert.Empty(t, gotURL)
-		assert.Empty(t, gotBearer)
+		assert.Empty(t, got.URL)
+		assert.Empty(t, got.Bearer)
 	})
 
 	t.Run("a url and a bearer", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
+		got, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
-		assert.Equal(t, url, gotURL)
-		assert.Equal(t, bearer, gotBearer)
+		assert.Equal(t, url, got.URL)
+		assert.Equal(t, bearer, got.Bearer)
 	})
 
 	t.Run("a url with no bearer refuses to boot", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url})
 
-		_, _, _, err := resolveRegistry(baseDomain)
+		_, err := resolveRegistry(baseDomain)
 		require.ErrorIs(t, err, errRegistryBearerRequired)
 	})
 
@@ -168,7 +169,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a url with no base domain refuses to boot", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		_, _, _, err := resolveRegistry("")
+		_, err := resolveRegistry("")
 		require.ErrorIs(t, err, errRegistryBaseDomainRequired)
 	})
 
@@ -177,7 +178,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("no base domain is fine without a registry", func(t *testing.T) {
 		withViper(t, nil)
 
-		_, _, _, err := resolveRegistry("")
+		_, err := resolveRegistry("")
 		require.NoError(t, err)
 	})
 
@@ -186,10 +187,10 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a bearer with no url is inert", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.bearer": bearer})
 
-		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
+		got, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
-		assert.Empty(t, gotURL)
-		assert.Equal(t, bearer, gotBearer)
+		assert.Empty(t, got.URL)
+		assert.Equal(t, bearer, got.Bearer)
 	})
 }
 
@@ -208,9 +209,9 @@ func TestResolveRegistryCachePath(t *testing.T) {
 	t.Run("unset falls back to the default", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		_, _, path, err := resolveRegistry(baseDomain)
+		got, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
-		assert.Equal(t, defaultRegistryCachePath, path)
+		assert.Equal(t, defaultRegistryCachePath, got.CachePath)
 	})
 
 	t.Run("set is honoured", func(t *testing.T) {
@@ -220,8 +221,54 @@ func TestResolveRegistryCachePath(t *testing.T) {
 			"registry.cache_path": "/srv/head/cache.json",
 		})
 
-		_, _, path, err := resolveRegistry(baseDomain)
+		got, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
-		assert.Equal(t, "/srv/head/cache.json", path)
+		assert.Equal(t, "/srv/head/cache.json", got.CachePath)
+	})
+}
+
+// The reconnect sweep runs inside the change stream's Connected callback and
+// no event is served past it, so its cap is the longest a reconnect may leave
+// the head deaf. It has a default because a deployment that never thought
+// about it should not get an unbounded one.
+func TestResolveRegistryRefreshTimeout(t *testing.T) {
+	const (
+		bearer     = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
+		url        = "https://gentility.example"
+		baseDomain = "overlay.example"
+	)
+
+	t.Run("unset falls back to the default", func(t *testing.T) {
+		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
+
+		got, err := resolveRegistry(baseDomain)
+		require.NoError(t, err)
+		assert.Equal(t, DefaultRegistryRefreshTimeout, got.RefreshTimeout)
+	})
+
+	t.Run("set is honoured", func(t *testing.T) {
+		withViper(t, map[string]any{
+			"registry.url":             url,
+			"registry.bearer":          bearer,
+			"registry.refresh_timeout": "90s",
+		})
+
+		got, err := resolveRegistry(baseDomain)
+		require.NoError(t, err)
+		assert.Equal(t, 90*time.Second, got.RefreshTimeout)
+	})
+
+	// Zero would be a sweep that is over before it starts, which is a
+	// head that reconnects and refreshes nothing, forever.
+	t.Run("zero is the default rather than no sweep at all", func(t *testing.T) {
+		withViper(t, map[string]any{
+			"registry.url":             url,
+			"registry.bearer":          bearer,
+			"registry.refresh_timeout": "0s",
+		})
+
+		got, err := resolveRegistry(baseDomain)
+		require.NoError(t, err)
+		assert.Equal(t, DefaultRegistryRefreshTimeout, got.RefreshTimeout)
 	})
 }

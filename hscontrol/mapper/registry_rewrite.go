@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/netip"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/registry"
@@ -37,6 +38,18 @@ const (
 	// is down, so a cache cannot quietly serve a document that moved an
 	// hour ago.
 	defaultWorldTTL = 60 * time.Second
+
+	// worldRefreshWorkers is how many Worlds a reconnect sweep reads at
+	// once. The sweep runs inside the change stream's Connected callback,
+	// which no event may be served past, so a serial sweep of a large
+	// installation is a stream that stays silent for as long as it takes —
+	// and against a Gentility that is answering slowly, that is
+	// nodes × [registryPeerTimeout].
+	//
+	// Eight rather than one-per-node: this is one head's own read amplifier
+	// pointed at one Gentility, and a sweep that opened a connection per
+	// cached node would recover from a blip by causing an outage.
+	worldRefreshWorkers = 8
 )
 
 // registryRewriteWithheld counts the map responses the rewrite refused to let
@@ -405,6 +418,19 @@ func (m *mapper) beginWorldRefresh() {
 // and the answer is that there is no document here. A node it merely could not
 // be reached about keeps its entry and is stamped into the new generation, so
 // an unreachable Gentility is asked once per TTL rather than once per build.
+// # The sweep is bounded, and what it does not reach it does not claim
+//
+// [worldRefreshWorkers] read at a time, under one deadline for the whole
+// sweep. Both bounds exist because this runs inside the stream's Connected
+// callback: nothing is served past it, so an unbounded sweep of a large
+// installation is a head that reconnects and then says nothing for hours.
+//
+// The deadline is a cap and not a budget: a node the sweep never reaches is
+// left UNREFRESHED, which is the pre-existing on-demand behaviour and is
+// already correct. Its next map build reads it before serving it, so the
+// gate's promise — nothing cached over a connection that has since dropped is
+// served as it stands — holds for every node whether the sweep got to it or
+// not. All the sweep buys is that those reads have already happened.
 func (m *mapper) refreshWorlds(ctx context.Context) {
 	if m.regClient == nil {
 		return
@@ -412,13 +438,59 @@ func (m *mapper) refreshWorlds(ctx context.Context) {
 
 	m.beginWorldRefresh()
 
-	for _, nodeID := range m.cachedNodes() {
-		m.refreshWorld(ctx, nodeID)
+	nodes := m.cachedNodes()
+	if len(nodes) == 0 {
+		return
 	}
+
+	sweep, cancel := context.WithTimeout(ctx, m.refreshTimeout())
+	defer cancel()
+
+	ids := make(chan types.NodeID)
+
+	var workers sync.WaitGroup
+
+	for range min(worldRefreshWorkers, len(nodes)) {
+		workers.Add(1)
+
+		go func() {
+			defer workers.Done()
+
+			for nodeID := range ids {
+				m.refreshWorld(sweep, nodeID)
+			}
+		}()
+	}
+
+feed:
+	for _, nodeID := range nodes {
+		select {
+		case ids <- nodeID:
+		case <-sweep.Done():
+			break feed
+		}
+	}
+
+	close(ids)
+	workers.Wait()
 }
 
-func (m *mapper) refreshWorld(ctx context.Context, nodeID types.NodeID) {
-	ctx, cancel := context.WithTimeout(ctx, registryPeerTimeout)
+// refreshTimeout is how long the whole sweep may take. Zero is a head built
+// without one — every Config literal in a test — and gets the default rather
+// than a sweep that is over before it starts.
+func (m *mapper) refreshTimeout() time.Duration {
+	if m.worldRefreshTimeout <= 0 {
+		return types.DefaultRegistryRefreshTimeout
+	}
+
+	return m.worldRefreshTimeout
+}
+
+// refreshWorld reads one node's World into the current generation. sweep is
+// the whole sweep's context, kept apart from the per-read one so the two
+// deadlines can be told apart: they mean opposite things about the entry.
+func (m *mapper) refreshWorld(sweep context.Context, nodeID types.NodeID) {
+	ctx, cancel := context.WithTimeout(sweep, registryPeerTimeout)
 	defer cancel()
 
 	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
@@ -436,6 +508,14 @@ func (m *mapper) refreshWorld(ctx context.Context, nodeID types.NodeID) {
 			Msg("registry has no world for a cached node; forgetting it")
 
 		m.invalidateWorld(nodeID)
+	case sweep.Err() != nil:
+		// The SWEEP ran out, not this read: nothing was learned about
+		// this node, so nothing is claimed about it. Leaving the entry
+		// unstamped is what makes the deadline a cap rather than a
+		// silent promotion of every unswept document to current.
+		log.Debug().
+			Uint64("node.id", nodeID.Uint64()).
+			Msg("registry world refresh ran out of time; leaving the node to be read on demand")
 	default:
 		log.Warn().
 			Err(err).

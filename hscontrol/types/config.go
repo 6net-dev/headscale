@@ -124,6 +124,12 @@ type Config struct {
 	// an unreachable Gentility serve the netmaps it last rendered.
 	RegistryCachePath string
 
+	// RegistryRefreshTimeout caps the reconnect sweep that reads every
+	// cached World again. It bounds the change stream's Connected
+	// callback, past which no event is served, so it is the longest a
+	// reconnect may leave the head silent.
+	RegistryRefreshTimeout time.Duration
+
 	IPAllocation        IPAllocationStrategy
 	NoisePrivateKeyPath string
 	BaseDomain          string
@@ -1164,6 +1170,26 @@ func resolveRegistryBearer() (string, error) {
 // it is survivable but never free.
 const defaultRegistryCachePath = "/var/lib/headscale/registry-cache.json"
 
+// DefaultRegistryRefreshTimeout caps the whole reconnect sweep.
+//
+// The sweep runs inside the change stream's Connected callback and no event
+// is served past it, so this is the longest a reconnect may leave the head
+// deaf. Thirty seconds is comfortably more than a healthy Gentility needs for
+// an installation of any size, and far less than the reconnect backoff's own
+// ceiling — so a head meeting a Gentility that answers but crawls reconnects
+// on schedule instead of stalling on the sweep, and reads what the sweep
+// missed on demand.
+const DefaultRegistryRefreshTimeout = 30 * time.Second
+
+// registrySettings is the registry channel's configuration, resolved
+// together because the first two are not usable alone.
+type registrySettings struct {
+	URL            string
+	Bearer         string
+	CachePath      string
+	RefreshTimeout time.Duration
+}
+
 // resolveRegistry is the registry channel's settings together, because the
 // first two are not usable alone.
 //
@@ -1187,19 +1213,19 @@ const defaultRegistryCachePath = "/var/lib/headscale/registry-cache.json"
 // A bearer with no url is inert rather than wrong: nothing reads it, and
 // refusing would break a deployment that stages the secret ahead of the
 // cutover. So is a base domain with no url — that is upstream headscale.
-func resolveRegistry(baseDomain string) (string, string, string, error) {
+func resolveRegistry(baseDomain string) (registrySettings, error) {
 	bearer, err := resolveRegistryBearer()
 	if err != nil {
-		return "", "", "", err
+		return registrySettings{}, err
 	}
 
 	url := viper.GetString("registry.url")
 	if url != "" && bearer == "" {
-		return "", "", "", errRegistryBearerRequired
+		return registrySettings{}, errRegistryBearerRequired
 	}
 
 	if url != "" && baseDomain == "" {
-		return "", "", "", errRegistryBaseDomainRequired
+		return registrySettings{}, errRegistryBaseDomainRequired
 	}
 
 	cachePath := viper.GetString("registry.cache_path")
@@ -1207,7 +1233,17 @@ func resolveRegistry(baseDomain string) (string, string, string, error) {
 		cachePath = defaultRegistryCachePath
 	}
 
-	return url, bearer, cachePath, nil
+	refresh := viper.GetDuration("registry.refresh_timeout")
+	if refresh <= 0 {
+		refresh = DefaultRegistryRefreshTimeout
+	}
+
+	return registrySettings{
+		URL:            url,
+		Bearer:         bearer,
+		CachePath:      cachePath,
+		RefreshTimeout: refresh,
+	}, nil
 }
 
 // LoadServerConfig returns the full Headscale configuration to
@@ -1303,7 +1339,7 @@ func LoadServerConfig() (*Config, error) {
 		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
-	registryURL, registryBearer, registryCachePath, err := resolveRegistry(dnsConfig.BaseDomain)
+	registry, err := resolveRegistry(dnsConfig.BaseDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -1333,12 +1369,13 @@ func LoadServerConfig() (*Config, error) {
 		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
-		PrefixV4:          prefix4,
-		PrefixV6:          prefix6,
-		RegistryURL:       registryURL,
-		RegistryBearer:    registryBearer,
-		RegistryCachePath: registryCachePath,
-		IPAllocation:      alloc,
+		PrefixV4:               prefix4,
+		PrefixV6:               prefix6,
+		RegistryURL:            registry.URL,
+		RegistryBearer:         registry.Bearer,
+		RegistryCachePath:      registry.CachePath,
+		RegistryRefreshTimeout: registry.RefreshTimeout,
+		IPAllocation:           alloc,
 
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
 			viper.GetString("noise.private_key_path"),

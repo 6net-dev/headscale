@@ -345,3 +345,82 @@ func TestRewriteIsInertWithoutARegistry(t *testing.T) {
 	require.NoError(t, (&mapper{}).rewriteFromRegistry(types.NodeID(1), resp))
 	assert.Len(t, resp.Peers, 1)
 }
+
+// filterRules runs one World's filters through the rewrite and returns the
+// rules it produced, which is the only place the head decides what may reach
+// what.
+func filterRules(t *testing.T, filters ...registry.Filter) []tailcfg.FilterRule {
+	t.Helper()
+
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr}, filters...),
+	})
+
+	resp := &tailcfg.MapResponse{PacketFilters: map[string][]tailcfg.FilterRule{"base": nil}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	return resp.PacketFilters["base"]
+}
+
+// A path names its port (design §8), so the rule it renders admits that port
+// and nothing else.
+func TestRewriteRendersOneRangePerPort(t *testing.T) {
+	rules := filterRules(t,
+		registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: []int{443}})
+
+	require.Len(t, rules, 1)
+	assert.Equal(t, []string{selfAddr + "/128"}, rules[0].SrcIPs)
+	require.Len(t, rules[0].DstPorts, 1)
+	assert.Equal(t, gatewayAddr+"/128", rules[0].DstPorts[0].IP)
+	assert.Equal(t, tailcfg.PortRange{First: 443, Last: 443}, rules[0].DstPorts[0].Ports)
+}
+
+// Several ports on one path are several ranges on one rule, each a single
+// port wide.
+func TestRewriteRendersEveryPortOfAPath(t *testing.T) {
+	rules := filterRules(t,
+		registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: []int{443, 8443}})
+
+	require.Len(t, rules, 1)
+	assert.Equal(t,
+		[]tailcfg.NetPortRange{
+			{IP: gatewayAddr + "/128", Ports: tailcfg.PortRange{First: 443, Last: 443}},
+			{IP: gatewayAddr + "/128", Ports: tailcfg.PortRange{First: 8443, Last: 8443}},
+		},
+		rules[0].DstPorts)
+}
+
+// An empty ports list is a path to NO port. Falling back to any-port would
+// turn a renderer that lost a service's port into an open door.
+func TestRewriteRendersNoRuleForAPathWithNoPorts(t *testing.T) {
+	rules := filterRules(t,
+		registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: nil})
+
+	assert.Empty(t, rules, "a path to no port admits nothing")
+}
+
+// The one rule that must never appear, whatever the World said.
+func TestRewriteNeverRendersPortRangeAny(t *testing.T) {
+	for _, ports := range [][]int{nil, {}, {443}, {443, 8443}, {0}, {65535}} {
+		rules := filterRules(t,
+			registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: ports})
+
+		for _, rule := range rules {
+			for _, dst := range rule.DstPorts {
+				assert.NotEqual(t, tailcfg.PortRangeAny, dst.Ports,
+					"ports %v rendered an any-port rule", ports)
+			}
+		}
+	}
+}
+
+// A port outside the range a port number has is a rendering fault, and a
+// fault renders nothing rather than something narrower or wider than asked.
+func TestRewriteDropsAnOutOfRangePort(t *testing.T) {
+	rules := filterRules(t,
+		registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: []int{443, 70000}})
+
+	require.Len(t, rules, 1)
+	require.Len(t, rules[0].DstPorts, 1)
+	assert.Equal(t, tailcfg.PortRange{First: 443, Last: 443}, rules[0].DstPorts[0].Ports)
+}

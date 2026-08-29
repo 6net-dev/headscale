@@ -3,6 +3,7 @@ package mapper
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/netip"
 	"slices"
 	"time"
@@ -261,22 +262,58 @@ func searchDomains(names []registry.Name, baseDomain string) []string {
 
 // applyWorldFilters replaces the head's packet filter with the World's rules:
 // traffic flows where a reach grant says it may and nowhere else.
+//
+// A path names its port. Design §8 renders an edge from a reach grant and the
+// service it points at, so the port is part of the path rather than a detail
+// left open, and each one becomes its own single-port range. There is no
+// [tailcfg.PortRangeAny] anywhere in here: a World that lost a port would then
+// render an open door in place of a closed one, which is the one failure this
+// filter exists to prevent.
 func applyWorldFilters(resp *tailcfg.MapResponse, world *registry.World) {
 	if resp.PacketFilters == nil {
 		return
 	}
 
 	rules := make([]tailcfg.FilterRule, 0, len(world.Filters))
+
 	for _, f := range world.Filters {
-		rules = append(rules, tailcfg.FilterRule{
-			SrcIPs: []string{f.Src},
-			DstPorts: []tailcfg.NetPortRange{
-				{IP: f.Dst, Ports: tailcfg.PortRangeAny},
-			},
-		})
+		ports := portRanges(f)
+
+		// An empty ports list is a path to NO port, and renders nothing.
+		if len(ports) == 0 {
+			continue
+		}
+
+		rules = append(rules, tailcfg.FilterRule{SrcIPs: []string{f.Src}, DstPorts: ports})
 	}
 
 	resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": rules}
+}
+
+// portRanges is one single-port range per port the path names, at the path's
+// destination. A number outside the range a port number has is a rendering
+// fault: it is dropped and logged, because widening or narrowing it would be
+// this head inventing a rule Gentility did not write.
+func portRanges(f registry.Filter) []tailcfg.NetPortRange {
+	ranges := make([]tailcfg.NetPortRange, 0, len(f.Ports))
+
+	for _, port := range f.Ports {
+		if port < 0 || port > math.MaxUint16 {
+			log.Warn().
+				Int("port", port).
+				Str("dst", f.Dst).
+				Msg("world filter named a port outside the port range")
+
+			continue
+		}
+
+		ranges = append(ranges, tailcfg.NetPortRange{
+			IP:    f.Dst,
+			Ports: tailcfg.PortRange{First: uint16(port), Last: uint16(port)},
+		})
+	}
+
+	return ranges
 }
 
 // applyWorldName names a node inside its first organization — the World lists

@@ -8,7 +8,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/rs/zerolog/log"
 	"tailscale.com/types/key"
 )
 
@@ -21,8 +20,18 @@ import (
 // registry.url installs none, and both call sites are then upstream headscale
 // unchanged.
 type RegistryHook interface {
-	Registered(ctx context.Context, r registry.Registration) error
+	// Registered reports an enrollment and answers with the World
+	// Gentility had for it, if any. It does NOT cache that World: the
+	// call is made from inside a transaction that may still roll back,
+	// and a document cached for a node the head then never committed is
+	// a document about nothing. [RegistryHook.SeedWorld] is the second
+	// half, and the caller makes it after the commit.
+	Registered(ctx context.Context, r registry.Registration) (*registry.World, error)
+
 	Rotated(ctx context.Context, r registry.Rotation) error
+
+	// SeedWorld puts a World where the head's map builds will find it.
+	SeedWorld(nodeID types.NodeID, world *registry.World)
 }
 
 // WorldSeeder takes the World that came back with a registration and puts it
@@ -45,31 +54,24 @@ func NewRegistryHook(client *registry.Client, seed WorldSeeder) RegistryHook {
 	return &registryCallbacks{client: client, seed: seed}
 }
 
-func (h *registryCallbacks) Registered(ctx context.Context, r registry.Registration) error {
+func (h *registryCallbacks) Registered(
+	ctx context.Context,
+	r registry.Registration,
+) (*registry.World, error) {
 	result, err := h.client.Register(ctx, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if result.World == nil || h.seed == nil {
-		return nil
+	return result.World, nil
+}
+
+func (h *registryCallbacks) SeedWorld(nodeID types.NodeID, world *registry.World) {
+	if h.seed == nil || world == nil {
+		return
 	}
 
-	// The inverse of [registry.NodeID], which is what put the id in the
-	// payload a moment ago. It cannot fail on a value this process wrote;
-	// a World that cannot be attributed to a node is dropped rather than
-	// guessed at, and costs one fetch when the node next polls.
-	nodeID, err := strconv.ParseUint(r.HeadNodeID, 10, 64)
-	if err != nil {
-		log.Warn().Str("head.node.id", r.HeadNodeID).
-			Msg("registration answered a world for something that is not a head node id")
-
-		return nil
-	}
-
-	h.seed(types.NodeID(nodeID), result.World)
-
-	return nil
+	h.seed(nodeID, world)
 }
 
 func (h *registryCallbacks) Rotated(ctx context.Context, r registry.Rotation) error {
@@ -133,9 +135,12 @@ func (s *State) SetRegistryHook(hook RegistryHook) {
 // Only a pre-auth-key registration is reported: an enrollment is what the
 // pre-auth key id identifies, and an interactive or OIDC registration has
 // none.
-func (s *State) recordRegistration(params newNodeParams, nodeID types.NodeID) error {
+func (s *State) recordRegistration(
+	params newNodeParams,
+	nodeID types.NodeID,
+) (*registry.World, error) {
 	if s.registry == nil || params.PreAuthKey == nil {
-		return nil
+		return nil, nil //nolint:nilnil // no registry, no world
 	}
 
 	// context.Background rather than a request context: what is being
@@ -144,17 +149,32 @@ func (s *State) recordRegistration(params newNodeParams, nodeID types.NodeID) er
 	// exactly that reason. A client that hangs up mid-registration must
 	// not leave the head and Gentility disagreeing about whether the node
 	// exists.
-	err := s.registry.Registered(context.Background(), registry.Registration{
+	world, err := s.registry.Registered(context.Background(), registry.Registration{
 		PreauthKeyID: strconv.FormatUint(params.PreAuthKey.ID, 10),
 		NodeKey:      params.NodeKey.String(),
 		MachineKey:   params.MachineKey.String(),
 		HeadNodeID:   registry.NodeID(nodeID.Uint64()),
 	})
 	if err != nil {
-		return registrationRefusal(err)
+		return nil, registrationRefusal(err)
 	}
 
-	return nil
+	return world, nil
+}
+
+// seedWorld caches the World a registration answered with, under the id the
+// head kept. It is called AFTER the write commits: a World cached from inside
+// the transaction would outlive a rollback, and the head would then serve a
+// document for a node that never existed until the entry aged out.
+//
+// The id is passed rather than parsed back out of the payload, so there is no
+// case where a World cannot be attributed to the node it was fetched for.
+func (s *State) seedWorld(nodeID types.NodeID, world *registry.World) {
+	if s.registry == nil || world == nil {
+		return
+	}
+
+	s.registry.SeedWorld(nodeID, world)
 }
 
 // registrationRefusal says how the client hears about it.

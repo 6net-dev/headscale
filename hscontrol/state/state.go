@@ -28,6 +28,7 @@ import (
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
+	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -1951,6 +1952,10 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		nodeToRegister.GivenName = dnsname.SanitizeHostname(nodeToRegister.Hostname)
 	}
 
+	// The World the registration answers with, seeded only once the write
+	// below has committed — see [State.seedWorld].
+	var registeredWorld *registry.World
+
 	// New node - database first to get ID, then [NodeStore]
 	savedNode, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
 		err := tx.Save(&nodeToRegister).Error
@@ -1990,15 +1995,24 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		// nothing will ever poll. Its stale record for an id the head
 		// abandoned is corrected by the registration of whoever ends
 		// up holding it.
-		if err := s.recordRegistration(params, nodeToRegister.ID); err != nil { //nolint:noinlineerr
+		world, err := s.recordRegistration(params, nodeToRegister.ID)
+		if err != nil {
 			return nil, err
 		}
+
+		registeredWorld = world
 
 		return &nodeToRegister, nil
 	})
 	if err != nil {
 		return types.NodeView{}, err
 	}
+
+	// Committed, so the node the World describes exists. Before the
+	// [NodeStore] rather than after only because the first map build for
+	// this node cannot run until it is in there, and the document should be
+	// waiting when it does.
+	s.seedWorld(savedNode.ID, registeredWorld)
 
 	// Add to [NodeStore] after database creates the ID
 	return s.nodeStore.PutNode(*savedNode), nil

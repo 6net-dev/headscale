@@ -777,3 +777,72 @@ func TestRegistryRetryAfterACommittedRegistrationReportsNothing(t *testing.T) {
 	registrations, _ := fake.recorded()
 	assert.Len(t, registrations, 1)
 }
+
+// TestRegistryHookAnswersTheWorldWithoutCachingIt is the seam M2 opens: the
+// callback runs inside a transaction that may still roll back, so it hands the
+// World back rather than putting it in the cache. A document cached from
+// inside a write that then failed would be served for a node that never
+// existed until it aged out of the TTL.
+func TestRegistryHookAnswersTheWorldWithoutCachingIt(t *testing.T) {
+	fake := newFakeRegistry(t)
+	fake.answers(http.StatusOK,
+		`{"node_id":"node-1","world":{"renderer_version":1,"revision":7,"head_node_id":"7"}}`)
+
+	seeded := &seededWorlds{}
+	hook := NewRegistryHook(registry.New(fake.server.URL, "test-bearer"), seeded.seed)
+
+	world, err := hook.Registered(t.Context(), registry.Registration{HeadNodeID: "7"})
+	require.NoError(t, err)
+	require.NotNil(t, world)
+	assert.Equal(t, int64(7), world.Revision)
+
+	assert.Nil(t, seeded.get(types.NodeID(7)),
+		"Registered answers with the World; it does not cache it")
+
+	// The caller's second move, once its write has committed.
+	hook.SeedWorld(types.NodeID(7), world)
+	assert.NotNil(t, seeded.get(types.NodeID(7)))
+}
+
+// TestRegistryWorldIsSeededOnlyAfterTheNodeIsCommitted: the id the World is
+// filed under is the id the head kept, and by the time it is filed the row is
+// there to be found.
+func TestRegistryWorldIsSeededOnlyAfterTheNodeIsCommitted(t *testing.T) {
+	fake := newFakeRegistry(t)
+	fake.answers(http.StatusOK,
+		`{"node_id":"node-1","world":{"renderer_version":1,"revision":7,"head_node_id":"1"}}`)
+
+	s, pak, seeded := registryTestState(t, fake)
+
+	node, _, err := s.HandleNodeFromPreAuthKey(
+		registerRequest(pak, key.NewNode().Public()),
+		key.NewMachine().Public(),
+	)
+	require.NoError(t, err)
+
+	require.NotNil(t, seeded.get(node.ID()))
+
+	stored, err := s.DB().GetNodeByID(node.ID())
+	require.NoError(t, err, "the row the seeded World describes must exist")
+	require.NotNil(t, stored)
+}
+
+// TestRegistryRefusalSeedsNothing: a registration Gentility refuses answers no
+// World, and a head that rolled the row back files nothing.
+func TestRegistryRefusalSeedsNothing(t *testing.T) {
+	fake := newFakeRegistry(t)
+	fake.answers(http.StatusConflict, `{}`)
+
+	s, pak, seeded := registryTestState(t, fake)
+
+	_, _, err := s.HandleNodeFromPreAuthKey(
+		registerRequest(pak, key.NewNode().Public()),
+		key.NewMachine().Public(),
+	)
+	require.Error(t, err)
+
+	seeded.mu.Lock()
+	defer seeded.mu.Unlock()
+
+	assert.Empty(t, seeded.worlds, "nothing is cached for a node that was never committed")
+}

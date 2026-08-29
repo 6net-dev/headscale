@@ -51,10 +51,19 @@ type World struct {
 const RendererVersion1 = 1
 
 // Name is a node's label inside one organization. A node holding grants in
-// several organizations is named separately in each.
+// several organizations is named separately in each, and Names is in the same
+// organization order as Addresses: the name at index i is the name the node
+// answers to at the address at index i. That pairing is what lets the head
+// show a peer only under the organization it shares with the viewer.
+//
+// Fqdn is the fully-qualified name Gentility composed. Prefer it where it is
+// present: the renderer is what knows what a name is made of. It is omitted by
+// a Gentility that does not send one yet, and the head then composes
+// "<label>.<org>.<base_domain>." for itself.
 type Name struct {
 	Org   string `json:"org"`
 	Label string `json:"label"`
+	Fqdn  string `json:"fqdn,omitempty"`
 }
 
 // Record is a DNS record for the platform hostname. Several records may carry

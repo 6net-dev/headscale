@@ -59,7 +59,7 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 
 	if resp.Node != nil {
 		applyWorldAddresses(resp.Node, world.Addresses)
-		applyWorldName(resp.Node, world.Names, m.baseDomain())
+		applyWorldName(resp.Node, world.Names, 0, m.baseDomain())
 	}
 
 	// Peers dropped by the rewrite must be announced in PeersRemoved:
@@ -207,14 +207,39 @@ func visibleAddresses(world *registry.World) map[netip.Addr]bool {
 	return visible
 }
 
-// holdsVisibleAddress reports whether any of a peer's own addresses is one
-// this node has a path to.
-func holdsVisibleAddress(world *registry.World, visible map[netip.Addr]bool) bool {
-	return slices.ContainsFunc(world.Addresses, func(own string) bool {
-		addr, err := netip.ParseAddr(own)
+// visibleThrough intersects a peer's own addresses with the set this node has
+// a path to, and returns them with the index of the first — which is the index
+// of the ORGANIZATION the peer is seen through, since a World lists its
+// addresses and its names in the same organization order.
+//
+// This is the org seam, on the one surface that can leak across it. A node
+// holding grants in two organizations has an address and a name in each, and a
+// viewer sharing only one of them has no business learning either half of the
+// other: handing the peer's whole World to the netmap would publish the other
+// tenant's address, and naming it after its primary organization would publish
+// that tenant's existence.
+//
+// An index of -1 means nothing intersected, and the caller drops the peer.
+func visibleThrough(world *registry.World, visible map[netip.Addr]bool) ([]string, int) {
+	var (
+		seen  []string
+		first = -1
+	)
 
-		return err == nil && visible[addr]
-	})
+	for index, own := range world.Addresses {
+		addr, err := netip.ParseAddr(own)
+		if err != nil || !visible[addr] {
+			continue
+		}
+
+		if first < 0 {
+			first = index
+		}
+
+		seen = append(seen, own)
+	}
+
+	return seen, first
 }
 
 // applyWorldDNS installs the search domains for every organization the node
@@ -316,16 +341,40 @@ func portRanges(f registry.Filter) []tailcfg.NetPortRange {
 	return ranges
 }
 
-// applyWorldName names a node inside its first organization — the World lists
-// them in the renderer's organization order, so the first is the node's
-// primary one. A node named in no organization keeps whatever the head gave
-// it, because a name assembled from nothing is not a name.
-func applyWorldName(node *tailcfg.Node, names []registry.Name, baseDomain string) {
-	if len(names) == 0 || baseDomain == "" {
-		return
+// applyWorldName names a node inside one organization: index 0 for a node
+// looking at itself, since the World lists organizations in the renderer's
+// order and the first is the node's primary one, and for a peer the
+// organization the viewer shares with it.
+//
+// A node with no name for that organization keeps whatever the head gave it,
+// because a name assembled from nothing is not a name.
+func applyWorldName(node *tailcfg.Node, names []registry.Name, index int, baseDomain string) {
+	if name := nameAt(names, index, baseDomain); name != "" {
+		node.Name = name
+	}
+}
+
+// nameAt is the fully-qualified name at one index of a World's names.
+//
+// Gentility sends the composed name in Fqdn where it has one, and that is the
+// answer: the renderer is what knows what a name is made of. Composing
+// "<label>.<org>.<base_domain>." here is the fallback for a Gentility that
+// does not send it yet, and it needs a base domain to compose from.
+func nameAt(names []registry.Name, index int, baseDomain string) string {
+	if index < 0 || index >= len(names) {
+		return ""
 	}
 
-	node.Name = names[0].Label + "." + names[0].Org + "." + baseDomain + "."
+	name := names[index]
+	if name.Fqdn != "" {
+		return name.Fqdn
+	}
+
+	if baseDomain == "" {
+		return ""
+	}
+
+	return name.Label + "." + name.Org + "." + baseDomain + "."
 }
 
 // rewriteWorldPeers keeps the peers the World's filters make visible, reading
@@ -346,14 +395,21 @@ func (m *mapper) rewriteWorldPeers(
 
 	for _, peer := range peers {
 		world := m.peerWorld(ctx, types.NodeID(peer.ID)) //nolint:gosec // IDs are bounded
-		if world == nil || !holdsVisibleAddress(world, visible) {
+		if world == nil {
 			removed = append(removed, peer.ID)
 
 			continue
 		}
 
-		applyWorldAddresses(peer, world.Addresses)
-		applyWorldName(peer, world.Names, m.baseDomain())
+		seen, org := visibleThrough(world, visible)
+		if len(seen) == 0 {
+			removed = append(removed, peer.ID)
+
+			continue
+		}
+
+		applyWorldAddresses(peer, seen)
+		applyWorldName(peer, world.Names, org, m.baseDomain())
 		kept = append(kept, peer)
 	}
 
@@ -377,7 +433,11 @@ func (m *mapper) keepVisiblePatches(
 
 	for _, patch := range patches {
 		world := m.peerWorld(ctx, types.NodeID(patch.NodeID)) //nolint:gosec // IDs are bounded
-		if world != nil && holdsVisibleAddress(world, visible) {
+		if world == nil {
+			continue
+		}
+
+		if seen, _ := visibleThrough(world, visible); len(seen) > 0 {
 			kept = append(kept, patch)
 		}
 	}

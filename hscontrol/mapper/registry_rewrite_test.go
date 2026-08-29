@@ -424,3 +424,101 @@ func TestRewriteDropsAnOutOfRangePort(t *testing.T) {
 	require.Len(t, rules[0].DstPorts, 1)
 	assert.Equal(t, tailcfg.PortRange{First: 443, Last: 443}, rules[0].DstPorts[0].Ports)
 }
+
+// Addresses in a second organization's /64, for the node that holds grants in
+// both.
+const (
+	betaSelfAddr = "fd7a:115c:a1e0:2::a"
+	betaPeerAddr = "fd7a:115c:a1e0:2::b"
+)
+
+// twoOrgPeer is a peer holding a live grant in two organizations: an address
+// and a name in each, in the renderer's organization order.
+func twoOrgPeer() *registry.World {
+	return &registry.World{
+		RendererVersion: registry.RendererVersion1,
+		Revision:        1,
+		HeadNodeID:      "2",
+		Addresses:       []string{reachedAddr, betaPeerAddr},
+		Names: []registry.Name{
+			{Org: "acme", Label: "shared"},
+			{Org: "beta", Label: "shared"},
+		},
+	}
+}
+
+// The org seam, on the one surface that can leak across it: a node sees a
+// peer through the organization it shares with it, and learns neither the
+// address the peer holds in another tenant nor the name it answers to there.
+func TestRewriteShowsAPeerOnlyInTheOrgTheFilterNames(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": twoOrgPeer(),
+	})
+
+	resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, []string{reachedAddr + "/128"}, prefixes(t, resp.Peers[0]),
+		"the address in an organization this node holds no path into is not its business")
+	assert.Equal(t, "shared.acme."+baseDomain+".", resp.Peers[0].Name,
+		"the name is the one the peer answers to in the shared organization")
+}
+
+// The same peer, seen from the other side of the seam: the other tenant sees
+// the other address and the other name, and neither tenant sees both.
+func TestRewriteShowsTheOtherOrgTheOtherHalf(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "beta", "n1", []string{betaSelfAddr},
+			registry.Filter{Src: betaSelfAddr + "/128", Dst: betaPeerAddr + "/128", Ports: []int{443}}),
+		"2": twoOrgPeer(),
+	})
+
+	resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, []string{betaPeerAddr + "/128"}, prefixes(t, resp.Peers[0]))
+	assert.Equal(t, "shared.beta."+baseDomain+".", resp.Peers[0].Name)
+}
+
+// Gentility composes the fully-qualified name itself. Where it sends one it is
+// the answer, because it is the renderer and not this head that knows what a
+// name is made of.
+func TestRewritePrefersTheRenderedFqdn(t *testing.T) {
+	peer := twoOrgPeer()
+	peer.Names[0].Fqdn = "rendered.acme.elsewhere.example."
+
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": peer,
+	})
+
+	resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, "rendered.acme.elsewhere.example.", resp.Peers[0].Name)
+}
+
+// A name assembled from nothing is not a name: with no name for the
+// organization the peer is seen through, the head's own stays.
+func TestRewriteKeepsTheHeadsNameWhenNoOrgNameMatches(t *testing.T) {
+	peer := twoOrgPeer()
+	peer.Names = nil
+
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": peer,
+	})
+
+	resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, "stale.example.", resp.Peers[0].Name)
+}

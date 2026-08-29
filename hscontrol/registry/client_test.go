@@ -536,3 +536,79 @@ func TestNewDefaultsTheIdleTimeout(t *testing.T) {
 	assert.Equal(t, time.Minute,
 		New("https://example.invalid", testBearer, WithIdleTimeout(time.Minute)).idleTimeout)
 }
+
+// # A document is bounded before it is believed
+//
+// Every decode here reads whatever is on the other end of the socket into
+// memory. The bearer authenticates that peer, but a compromised or simply
+// broken Gentility — or anything that can answer in its place — should not be
+// able to spend this head's whole address space by answering one World call.
+
+// TestWorldRefusesAnOversizedDocument: an otherwise valid World past the cap
+// is refused rather than read. It is not [ErrUnknownNode] or [ErrNotRendered],
+// so the caller treats it as an outage: the head serves what it has cached and
+// withholds the response if it has none.
+func TestWorldRefusesAnOversizedDocument(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"renderer_version":1,"head_node_id":"3","addresses":["`)
+
+		chunk := make([]byte, 1<<16)
+		for i := range chunk {
+			chunk[i] = 'a'
+		}
+
+		for written := 0; written < maxDocumentBytes+1; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+
+		fmt.Fprint(w, `"]}`)
+	})
+
+	world, err := client.World(t.Context(), "3")
+	require.Error(t, err)
+	assert.Nil(t, world)
+
+	assert.NotErrorIs(t, err, ErrUnknownNode)
+	assert.NotErrorIs(t, err, ErrNotRendered)
+}
+
+// The same cap on the registration's answer, which carries a World of its own.
+func TestRegisterRefusesAnOversizedDocument(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"node_id":"`)
+
+		chunk := make([]byte, 1<<16)
+		for i := range chunk {
+			chunk[i] = 'a'
+		}
+
+		for written := 0; written < maxDocumentBytes+1; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+
+		fmt.Fprint(w, `"}`)
+	})
+
+	result, err := client.Register(t.Context(), Registration{HeadNodeID: "3"})
+	require.Error(t, err)
+	assert.Nil(t, result)
+}
+
+// A document comfortably inside the cap still decodes: the bound is a ceiling
+// on the pathological, not a budget the renderer has to fit in.
+func TestWorldDecodesADocumentUnderTheCap(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, worldV1)
+	})
+
+	world, err := client.World(t.Context(), "3")
+	require.NoError(t, err)
+	assert.Equal(t, "3", world.HeadNodeID)
+}

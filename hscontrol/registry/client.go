@@ -59,6 +59,22 @@ const (
 	defaultIdleTimeout = 60 * time.Second
 )
 
+// maxDocumentBytes caps a JSON body this client reads into memory.
+//
+// Every decode below reads whatever is on the other end of the socket. The
+// bearer authenticates that peer, but a Gentility that is compromised, broken,
+// or merely mid-deploy behind something that answers in its place should not
+// be able to spend a head's whole address space by answering one World call —
+// and a head that OOMs is every node it serves losing its netmap.
+//
+// Eight mebibytes is far past anything the renderer can produce (a World for a
+// node with a hundred paths is a few kilobytes) and far short of what an
+// unbounded decode could cost. A body over it is TRUNCATED, so the decode
+// fails with an unexpected end of input, which is the right class of answer:
+// on world it is an outage, so the head serves what it has cached and
+// withholds if it has none; on register it rolls the node write back.
+const maxDocumentBytes = 8 << 20
+
 // Errors, one per cell of §2.3's status table that a caller can act on.
 var (
 	// ErrUnauthorized: 401. The bearer is not the one Gentility expects.
@@ -202,7 +218,7 @@ func (c *Client) World(ctx context.Context, headNodeID string) (*World, error) {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var world World
-		if err := json.NewDecoder(resp.Body).Decode(&world); err != nil {
+		if err := decodeDocument(resp, &world); err != nil { //nolint:noinlineerr
 			return nil, fmt.Errorf("registry: decoding world: %w", err)
 		}
 
@@ -231,7 +247,7 @@ func (c *Client) Register(ctx context.Context, reg Registration) (*RegistrationR
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var result RegistrationResult
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := decodeDocument(resp, &result); err != nil { //nolint:noinlineerr
 			return nil, fmt.Errorf("registry: decoding registration: %w", err)
 		}
 
@@ -477,9 +493,16 @@ func behindHorizon(resp *http.Response) error {
 		CompactionHorizon int64 `json:"compaction_horizon"`
 	}
 
-	_ = json.NewDecoder(resp.Body).Decode(&payload)
+	_ = decodeDocument(resp, &payload)
 
 	return &BehindHorizonError{CompactionHorizon: payload.CompactionHorizon}
+}
+
+// decodeDocument reads one JSON body, bounded by [maxDocumentBytes]. Every
+// decode on this channel goes through here so the cap is one rule rather than
+// a habit somebody has to remember at each new call site.
+func decodeDocument(resp *http.Response, into any) error {
+	return json.NewDecoder(io.LimitReader(resp.Body, maxDocumentBytes)).Decode(into)
 }
 
 func (c *Client) post(ctx context.Context, path string, payload any) (*http.Response, error) {

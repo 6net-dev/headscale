@@ -260,7 +260,8 @@ func TestChangesReadsGentilitysFraming(t *testing.T) {
 	require.NoError(t, err, "a clean end of stream is how a long poll ends")
 
 	assert.Equal(t, "since=40", gotQuery)
-	assert.Equal(t, "text/event-stream", gotAccept)
+	assert.Equal(t, "text/event-stream, application/json", gotAccept,
+		"Gentility puts the stream behind plug :accepts, [\"json\"]")
 	assert.Equal(t, 1, connected)
 	assert.Equal(t, []Change{
 		{Seq: 41, HeadNodeID: "3", WorldRevision: 17},

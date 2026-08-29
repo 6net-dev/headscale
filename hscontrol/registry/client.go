@@ -256,7 +256,13 @@ func (c *Client) Changes(ctx context.Context, since int64, h ChangeHandler) erro
 		return err
 	}
 
-	req.Header.Set("Accept", "text/event-stream")
+	// application/json is not decoration. Gentility puts the change stream
+	// behind the same `plug :accepts, ["json"]` as the other three calls, and
+	// Phoenix answers an Accept header naming only text/event-stream with a
+	// 406 before the controller is ever reached. Naming both is honest —
+	// the stream is what we want, JSON is what its frames and its refusals
+	// are made of — and it is what gets through that pipeline.
+	req.Header.Set("Accept", "text/event-stream, application/json")
 	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, err := c.stream.Do(req)

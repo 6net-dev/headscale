@@ -1658,6 +1658,15 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
+	// A key change here is a rotation, and this path holds no pre-auth key
+	// to present one with. Registry mode records a rotation from the
+	// re-registration path and nowhere else — see
+	// [ErrRegistryInteractiveRotation] — so refuse before the NodeStore is
+	// touched. An unchanged key is not a rotation and passes.
+	if s.registryMode() && params.ExistingNode.NodeKey() != regData.NodeKey {
+		return types.NodeView{}, ErrRegistryInteractiveRotation
+	}
+
 	// Update existing node in [NodeStore] - validation passed, safe to mutate
 	updatedNodeView, ok := s.nodeStore.UpdateNode(params.ExistingNode.ID(), func(node *types.Node) {
 		node.NodeKey = regData.NodeKey
@@ -1802,6 +1811,14 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 // createAndSaveNewNode creates a new node, allocates IPs, saves to DB, and adds to [NodeStore].
 // It preserves netinfo from an existing node if one is provided (for faster DERP connectivity).
 func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, error) {
+	// Registry mode admits nodes by pre-auth key and by nothing else: the
+	// key id is what names an enrollment on channel 3, so a creation
+	// without one is a node the head could commit and never report. Before
+	// any resource is allocated — see [ErrRegistryPreAuthKeyOnly].
+	if s.registryMode() && params.PreAuthKey == nil {
+		return types.NodeView{}, ErrRegistryPreAuthKeyOnly
+	}
+
 	// Preserve NetInfo from existing node if available
 	if params.Hostinfo != nil {
 		params.Hostinfo.NetInfo = preserveNetInfo(

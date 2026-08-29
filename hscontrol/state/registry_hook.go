@@ -76,6 +76,48 @@ func (h *registryCallbacks) Rotated(ctx context.Context, r registry.Rotation) er
 	return h.client.Rotate(ctx, r)
 }
 
+// ErrRegistryPreAuthKeyOnly refuses an enrollment registry mode cannot report.
+//
+// Design §4 channel 3 identifies an enrollment by the pre-auth key id
+// Gentility minted through the head's own API (§2.3), and there is no other
+// name for one. An interactive registration — gRPC `headscale nodes register`
+// or an OIDC callback — carries no such key, so [State.recordRegistration]
+// would report nothing and the head would commit a node Gentility has never
+// heard of: unreported, never rendered, served no World, and refused as an
+// unknown node by every map build for the whole of its life.
+//
+// Refusing at the point of creation is the honest answer. The alternative is a
+// node that exists and does not work, which is the failure this whole channel
+// is built to make impossible.
+var ErrRegistryPreAuthKeyOnly = errors.New("registry mode: enrollment is by pre-auth key only")
+
+// ErrRegistryInteractiveRotation refuses a node key rotation registry mode
+// cannot record.
+//
+// [State.applyAuthNodeUpdate] rotates a node's key to whatever the client
+// supplied, and it is reachable ONLY from [State.HandleNodeFromAuthPath] —
+// whose only two callers are grpcv1.go's RegisterNode and oidc.go's
+// handleRegistration. Neither holds a pre-auth key, and neither is an
+// enrollment: the node already exists, so there is nothing to register and
+// only a key to move.
+//
+// It refuses rather than calling [State.recordRotation], for consistency with
+// [ErrRegistryPreAuthKeyOnly] rather than out of any difficulty. Registry mode
+// admits nodes by pre-auth key alone, and the re-registration path in
+// [State.HandleNodeFromPreAuthKey] — which does hold one — is where a rotation
+// belongs and where channel 4 records it. Letting the interactive path rotate
+// a key would leave a second, unreported way for a node's identity to move.
+var ErrRegistryInteractiveRotation = errors.New(
+	"registry mode: a node key rotation must be presented with a pre-auth key",
+)
+
+// registryMode says whether this head is one Gentility is authoritative for.
+// A head with no registry.url installs no hook and is upstream headscale, so
+// none of the refusals above apply to it.
+func (s *State) registryMode() bool {
+	return s.registry != nil
+}
+
 // SetRegistryHook installs the callbacks Gentility is recorded through. It is
 // called once at boot, before the head serves anything, because the two call
 // sites read it without a lock: a head either has a registry for the whole of

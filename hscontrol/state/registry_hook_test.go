@@ -12,6 +12,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -448,4 +449,142 @@ func assertNodeKey(t *testing.T, s *State, id types.NodeID, want key.NodePublic)
 	cached, ok := s.GetNodeByID(id)
 	require.True(t, ok)
 	assert.Equal(t, want, cached.NodeKey(), "the NodeStore must hold this key")
+}
+
+// # Registry mode admits nodes by pre-auth key and by nothing else
+//
+// Design §4 channel 3 identifies an enrollment by the pre-auth key id
+// Gentility minted through the head's own API. An interactive registration —
+// gRPC `headscale nodes register`, or an OIDC callback — carries no such key,
+// so there is nothing to report and the node would exist on the head and
+// nowhere else: unreported, unrendered, and served no World for the whole of
+// its life. The head refuses instead.
+
+// TestRegistryRefusesGRPCRegistration: `headscale nodes register` reaches
+// [State.HandleNodeFromAuthPath] with no pre-auth key (grpcv1.go:RegisterNode),
+// and there is no enrollment for it to be part of.
+func TestRegistryRefusesGRPCRegistration(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, _, _ := registryTestState(t, fake)
+
+	user := s.CreateUserForTest("interactive-user")
+
+	authID := authPathRequest(t, s, key.NewMachine().Public(), key.NewNode().Public())
+
+	_, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.ErrorIs(t, err, ErrRegistryPreAuthKeyOnly)
+
+	assertNoNodes(t, s)
+
+	registrations, _ := fake.recorded()
+	assert.Empty(t, registrations, "a refused enrollment reports nothing")
+}
+
+// TestRegistryRefusesOIDCRegistration is the same refusal on the other caller
+// of [State.HandleNodeFromAuthPath] (oidc.go:handleRegistration). The method
+// differs; the missing pre-auth key does not.
+func TestRegistryRefusesOIDCRegistration(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, _, _ := registryTestState(t, fake)
+
+	user := s.CreateUserForTest("oidc-user")
+
+	authID := authPathRequest(t, s, key.NewMachine().Public(), key.NewNode().Public())
+
+	_, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC)
+	require.ErrorIs(t, err, ErrRegistryPreAuthKeyOnly)
+
+	assertNoNodes(t, s)
+}
+
+// TestRegistryAllowsInteractiveRegistrationWithoutARegistry: the refusal is
+// registry mode's and not headscale's. A head with no registry.url is upstream
+// headscale, and `headscale nodes register` works exactly as it always did.
+func TestRegistryAllowsInteractiveRegistrationWithoutARegistry(t *testing.T) {
+	s, _, _ := registryTestState(t, nil)
+
+	user := s.CreateUserForTest("interactive-user")
+
+	authID := authPathRequest(t, s, key.NewMachine().Public(), key.NewNode().Public())
+
+	node, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.NoError(t, err)
+	assert.True(t, node.Valid())
+}
+
+// TestRegistryRefusesInteractiveKeyRotation: a node enrolled by pre-auth key
+// can still reach [State.applyAuthNodeUpdate] through the same two callers,
+// and the client-supplied node key there is a rotation. That path holds no
+// pre-auth key either, so a head that let it through would commit a key
+// Gentility could not attribute — the one thing channel 4 exists to stop.
+func TestRegistryRefusesInteractiveKeyRotation(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	oldKey := key.NewNode()
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	user, err := s.GetUserByName("registry-user")
+	require.NoError(t, err)
+
+	authID := authPathRequest(t, s, machineKey.Public(), key.NewNode().Public())
+
+	_, _, err = s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC)
+	require.ErrorIs(t, err, ErrRegistryInteractiveRotation)
+
+	assertNodeKey(t, s, node.ID(), oldKey.Public())
+
+	_, rotations := fake.recorded()
+	assert.Empty(t, rotations, "a refused rotation reports nothing")
+}
+
+// TestRegistryAllowsInteractiveReauthWithTheSameKey: only a KEY CHANGE is a
+// rotation. A re-auth presenting the key the node already holds moves nothing
+// Gentility records, and refusing it would break a relogin that is only
+// refreshing an expiry.
+func TestRegistryAllowsInteractiveReauthWithTheSameKey(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	nodeKey := key.NewNode()
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, nodeKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	user, err := s.GetUserByName("registry-user")
+	require.NoError(t, err)
+
+	authID := authPathRequest(t, s, machineKey.Public(), nodeKey.Public())
+
+	again, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC)
+	require.NoError(t, err)
+	assert.Equal(t, node.ID(), again.ID())
+
+	assertNodeKey(t, s, node.ID(), nodeKey.Public())
+}
+
+// authPathRequest stages the cached registration the auth callback resolves,
+// which is what makes the gRPC and OIDC paths reachable from a unit test.
+func authPathRequest(
+	t *testing.T,
+	s *State,
+	machineKey key.MachinePublic,
+	nodeKey key.NodePublic,
+) types.AuthID {
+	t.Helper()
+
+	authID := types.MustAuthID()
+	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey,
+		NodeKey:    nodeKey,
+		DiscoKey:   key.NewDisco().Public(),
+		Hostname:   "interactive-node",
+		Hostinfo:   &tailcfg.Hostinfo{Hostname: "interactive-node"},
+	}))
+
+	return authID
 }

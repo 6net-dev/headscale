@@ -61,9 +61,16 @@ type mapper struct {
 
 	// worldCache holds the last world seen per node so registry
 	// outages degrade to stale-but-sealed netmaps (fail-closed), and so
-	// that a map build does not re-fetch every peer's document.
-	worldCache   map[types.NodeID]*registry.World
+	// that a map build does not re-fetch every peer's document. Entries
+	// carry the time they were read and are believed for worldTTL.
+	worldCache   map[types.NodeID]cachedWorld
 	worldCacheMu sync.Mutex
+
+	// worldTTL is how long a cached World is believed without asking
+	// again; now is the clock that judges it, injectable because a
+	// minute-long TTL is otherwise only testable by waiting a minute.
+	worldTTL time.Duration
+	now      func() time.Time
 
 	created time.Time
 }
@@ -94,7 +101,9 @@ func newMapper(
 
 	if cfg.RegistryURL != "" {
 		m.regClient = registry.New(cfg.RegistryURL, cfg.RegistryBearer)
-		m.worldCache = make(map[types.NodeID]*registry.World)
+		m.worldCache = make(map[types.NodeID]cachedWorld)
+		m.worldTTL = defaultWorldTTL
+		m.now = time.Now
 	}
 
 	return m

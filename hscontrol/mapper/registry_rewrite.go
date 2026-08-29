@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/netip"
@@ -14,7 +15,52 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-const registryWorldTimeout = 3 * time.Second
+const (
+	// registrySelfTimeout bounds the fetch of the node's OWN World, the
+	// document this map is being rewritten from. Nothing can be sent
+	// without it.
+	registrySelfTimeout = 3 * time.Second
+
+	// registryPeerTimeout is what each peer gets, on a context of its own.
+	// One deadline shared across a build would hand the last peer in a
+	// large netmap whatever the peers before it left over, so a single slow
+	// answer would silently drop the tail of the list — and which peers
+	// those were would depend on the order they happened to be in.
+	registryPeerTimeout = 2 * time.Second
+
+	// defaultWorldTTL is how long a cached World is believed without asking
+	// again. The change stream is what SHOULD invalidate an entry (B6, via
+	// [Batcher.InvalidateWorld]); the TTL is the floor under a stream that
+	// is down, so a cache cannot quietly serve a document that moved an
+	// hour ago.
+	defaultWorldTTL = 60 * time.Second
+)
+
+// cachedWorld is one remembered document and when it was read, since a copy of
+// something that moves is only as good as its age.
+type cachedWorld struct {
+	world *registry.World
+	at    time.Time
+}
+
+// peerFate is what one round of the rewrite can say about one peer.
+type peerFate int
+
+const (
+	// peerKnown: the World was read, or a cached one stands in for it.
+	peerKnown peerFate = iota
+
+	// peerRefused: Gentility answered, and the answer was that there is no
+	// World here — unknown, revoked, nothing rendered, or a shape this head
+	// cannot enforce. The peer is dropped and the drop is announced.
+	peerRefused
+
+	// peerUnreached: no answer arrived, and nothing is cached. The round
+	// says NOTHING about the peer: it is left out of this response and out
+	// of PeersRemoved, because announcing a removal would tell the client a
+	// revocation happened on the evidence of a timeout.
+	peerUnreached
+)
 
 // rewriteFromRegistry makes Gentility authoritative for topology,
 // addressing, naming, DNS, and filters: the World contract is applied to
@@ -47,10 +93,7 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), registryWorldTimeout)
-	defer cancel()
-
-	world, err := m.fetchWorld(ctx, nodeID)
+	world, err := m.fetchWorld(nodeID)
 	if err != nil {
 		return err
 	}
@@ -67,10 +110,10 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 	// change", so silence would leave stale peers on the client.
 	var removed []tailcfg.NodeID
 
-	resp.Peers, removed = m.rewriteWorldPeers(ctx, resp.Peers, visible, removed)
-	resp.PeersChanged, removed = m.rewriteWorldPeers(ctx, resp.PeersChanged, visible, removed)
+	resp.Peers, removed = m.rewriteWorldPeers(resp.Peers, visible, removed)
+	resp.PeersChanged, removed = m.rewriteWorldPeers(resp.PeersChanged, visible, removed)
 	resp.PeersRemoved = append(resp.PeersRemoved, removed...)
-	resp.PeersChangedPatch = m.keepVisiblePatches(ctx, resp.PeersChangedPatch, visible)
+	resp.PeersChangedPatch = m.keepVisiblePatches(resp.PeersChangedPatch, visible)
 
 	applyWorldDNS(resp, world, m.baseDomain())
 	applyWorldFilters(resp, world)
@@ -90,7 +133,10 @@ func (m *mapper) baseDomain() string {
 // map is being rewritten from. A registry that cannot be reached degrades to
 // the last World seen for that node; a node with no cached World has no
 // document to be sealed against, and the caller withholds the response.
-func (m *mapper) fetchWorld(ctx context.Context, nodeID types.NodeID) (*registry.World, error) {
+func (m *mapper) fetchWorld(nodeID types.NodeID) (*registry.World, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), registrySelfTimeout)
+	defer cancel()
+
 	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
 	if err == nil {
 		if verr := supportedWorld(world); verr != nil {
@@ -102,7 +148,7 @@ func (m *mapper) fetchWorld(ctx context.Context, nodeID types.NodeID) (*registry
 		return world, nil
 	}
 
-	cached := m.cachedWorld(nodeID)
+	cached, _ := m.cachedWorld(nodeID)
 	if cached == nil {
 		return nil, fmt.Errorf("registry unreachable and no cached world for node %d: %w", nodeID, err)
 	}
@@ -117,35 +163,70 @@ func (m *mapper) fetchWorld(ctx context.Context, nodeID types.NodeID) (*registry
 
 // peerWorld reads a peer's World, cache first: a map build touches every peer
 // and the change stream keeps the cache current, so a fetch per peer per map
-// would be the same document asked for over and over.
+// would be the same document asked for over and over. A cached entry past its
+// TTL is re-read, and stood in for only if the read fails.
 //
-// A nil answer means this head cannot say where the peer lives, and the
-// caller drops it rather than guessing — the same fail-closed rule the node's
-// own World follows.
-func (m *mapper) peerWorld(ctx context.Context, nodeID types.NodeID) *registry.World {
-	if cached := m.cachedWorld(nodeID); cached != nil {
-		return cached
+// # A refusal and an outage are different facts
+//
+// Gentility saying there is no World here ([registry.ErrUnknownNode],
+// [registry.ErrNotRendered]) is an ANSWER, and the peer is dropped and the drop
+// announced. A read that did not complete — a timeout, a 5xx, a 429 — is not an
+// answer at all: with a cached document the peer is served as last seen, and
+// with none this round says nothing about it. Treating the second as the first
+// would have every registry hiccup tell every client that its peers had been
+// revoked, and a netmap rebuilt from a lie is worse than one rebuilt late.
+func (m *mapper) peerWorld(nodeID types.NodeID) (*registry.World, peerFate) {
+	cached, fresh := m.cachedWorld(nodeID)
+	if fresh {
+		return cached, peerKnown
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), registryPeerTimeout)
+	defer cancel()
 
 	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
 	if err != nil {
+		if errors.Is(err, registry.ErrUnknownNode) || errors.Is(err, registry.ErrNotRendered) {
+			log.Info().
+				Err(err).
+				Uint64("peer.id", nodeID.Uint64()).
+				Msg("registry has no world for peer; dropping it from the netmap")
+
+			m.invalidateWorld(nodeID)
+
+			return nil, peerRefused
+		}
+
+		if cached != nil {
+			log.Warn().
+				Err(err).
+				Uint64("peer.id", nodeID.Uint64()).
+				Msg("registry world fetch failed for peer; serving it as last seen")
+
+			return cached, peerKnown
+		}
+
 		log.Warn().
 			Err(err).
 			Uint64("peer.id", nodeID.Uint64()).
-			Msg("registry world fetch failed for peer; dropping it from the netmap")
+			Msg("registry world fetch failed for peer and none is cached; saying nothing about it")
 
-		return nil
+		return nil, peerUnreached
 	}
 
 	if err := supportedWorld(world); err != nil {
+		// A shape this head cannot enforce is a refusal rather than an
+		// outage: reading it again would answer the same.
 		log.Warn().Err(err).Uint64("peer.id", nodeID.Uint64()).Msg("dropping peer")
 
-		return nil
+		m.invalidateWorld(nodeID)
+
+		return nil, peerRefused
 	}
 
 	m.cacheWorld(nodeID, world)
 
-	return world
+	return world, peerKnown
 }
 
 // supportedWorld refuses a renderer version this head was not built against.
@@ -159,18 +240,36 @@ func supportedWorld(world *registry.World) error {
 	return nil
 }
 
-func (m *mapper) cachedWorld(nodeID types.NodeID) *registry.World {
+// cachedWorld returns the remembered World and whether it is still inside its
+// TTL. A stale entry is still returned: it is what a failed re-read falls back
+// on.
+func (m *mapper) cachedWorld(nodeID types.NodeID) (*registry.World, bool) {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
 
-	return m.worldCache[nodeID]
+	entry, ok := m.worldCache[nodeID]
+	if !ok {
+		return nil, false
+	}
+
+	return entry.world, m.now().Sub(entry.at) < m.worldTTL
 }
 
 func (m *mapper) cacheWorld(nodeID types.NodeID, world *registry.World) {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
 
-	m.worldCache[nodeID] = world
+	m.worldCache[nodeID] = cachedWorld{world: world, at: m.now()}
+}
+
+// invalidateWorld forgets one node's cached World. It is the seam the change
+// stream drives: an event names a node, and the next map build reads that
+// node's document afresh instead of waiting out [defaultWorldTTL].
+func (m *mapper) invalidateWorld(nodeID types.NodeID) {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	delete(m.worldCache, nodeID)
 }
 
 // visibleAddresses is the peer set, derived: every address a filter names as
@@ -382,7 +481,6 @@ func nameAt(names []registry.Name, index int, baseDomain string) string {
 // rest in removed. A nil slice stays nil — deltas rely on the nil/empty
 // distinction.
 func (m *mapper) rewriteWorldPeers(
-	ctx context.Context,
 	peers []*tailcfg.Node,
 	visible map[netip.Addr]bool,
 	removed []tailcfg.NodeID,
@@ -394,8 +492,14 @@ func (m *mapper) rewriteWorldPeers(
 	kept := peers[:0]
 
 	for _, peer := range peers {
-		world := m.peerWorld(ctx, types.NodeID(peer.ID)) //nolint:gosec // IDs are bounded
-		if world == nil {
+		world, fate := m.peerWorld(types.NodeID(peer.ID)) //nolint:gosec // IDs are bounded
+		if fate == peerUnreached {
+			// Neither kept nor announced: this round has nothing to
+			// say about a peer it could not read.
+			continue
+		}
+
+		if fate == peerRefused {
 			removed = append(removed, peer.ID)
 
 			continue
@@ -421,7 +525,6 @@ func (m *mapper) rewriteWorldPeers(
 // the same rule the peer itself was, and never by whether it happens to
 // appear in this response.
 func (m *mapper) keepVisiblePatches(
-	ctx context.Context,
 	patches []*tailcfg.PeerChange,
 	visible map[netip.Addr]bool,
 ) []*tailcfg.PeerChange {
@@ -432,7 +535,7 @@ func (m *mapper) keepVisiblePatches(
 	kept := patches[:0]
 
 	for _, patch := range patches {
-		world := m.peerWorld(ctx, types.NodeID(patch.NodeID)) //nolint:gosec // IDs are bounded
+		world, _ := m.peerWorld(types.NodeID(patch.NodeID)) //nolint:gosec // IDs are bounded
 		if world == nil {
 			continue
 		}

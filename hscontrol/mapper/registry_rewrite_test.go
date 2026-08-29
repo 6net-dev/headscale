@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -31,13 +32,35 @@ type fakeWorlds struct {
 	worlds map[string]*registry.World
 	errs   map[string]error
 	calls  map[string]int
+
+	// budgets is how long each call had left when it arrived, which is
+	// what says whether the fetches share a deadline or hold their own.
+	budgets map[string]time.Duration
+
+	// slow is how long a call takes, so one fetch can be made to eat into
+	// whatever budget the next one is given.
+	slow map[string]time.Duration
 }
 
-func (f *fakeWorlds) World(_ context.Context, headNodeID string) (*registry.World, error) {
+func (f *fakeWorlds) World(ctx context.Context, headNodeID string) (*registry.World, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.calls[headNodeID]++
+
+	if deadline, ok := ctx.Deadline(); ok {
+		f.budgets[headNodeID] = time.Until(deadline)
+	}
+
+	slow := f.slow[headNodeID]
+
+	f.mu.Unlock()
+
+	if slow > 0 {
+		time.Sleep(slow)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if err, ok := f.errs[headNodeID]; ok {
 		return nil, err
@@ -51,6 +74,13 @@ func (f *fakeWorlds) World(_ context.Context, headNodeID string) (*registry.Worl
 	return world, nil
 }
 
+func (f *fakeWorlds) budgetFor(headNodeID string) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.budgets[headNodeID]
+}
+
 func (f *fakeWorlds) callsFor(headNodeID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -60,9 +90,11 @@ func (f *fakeWorlds) callsFor(headNodeID string) int {
 
 func newFakeWorlds(worlds map[string]*registry.World) *fakeWorlds {
 	return &fakeWorlds{
-		worlds: worlds,
-		errs:   map[string]error{},
-		calls:  map[string]int{},
+		worlds:  worlds,
+		errs:    map[string]error{},
+		calls:   map[string]int{},
+		budgets: map[string]time.Duration{},
+		slow:    map[string]time.Duration{},
 	}
 }
 
@@ -70,9 +102,19 @@ func newTestMapper(store worldSource) *mapper {
 	return &mapper{
 		cfg:        &types.Config{BaseDomain: baseDomain},
 		regClient:  store,
-		worldCache: map[types.NodeID]*registry.World{},
+		worldCache: map[types.NodeID]cachedWorld{},
+		worldTTL:   defaultWorldTTL,
+		now:        time.Now,
 	}
 }
+
+// clock is a hand-wound now for the cache TTL, which is otherwise only
+// testable by waiting a minute.
+type clock struct{ at time.Time }
+
+func (c *clock) now() time.Time { return c.at }
+
+func (c *clock) advance(d time.Duration) { c.at = c.at.Add(d) }
 
 // world is a v1 World for one node: its own addresses and names, and the
 // filters that decide who it can see.
@@ -195,10 +237,31 @@ func TestRewriteNeverKeepsTheNodeAsItsOwnPeer(t *testing.T) {
 	assert.Equal(t, []tailcfg.NodeID{1}, resp.PeersRemoved)
 }
 
-// A peer this head cannot place is a peer it cannot prove is reachable, so it
-// is dropped rather than passed through — the same fail-closed rule the node's
-// own World follows.
-func TestRewriteDropsAPeerWhoseWorldCannotBeRead(t *testing.T) {
+// Gentility REFUSING a peer is an answer: there is no such World, or none has
+// been rendered. The peer is dropped and the drop is announced, because the
+// client would otherwise keep it forever.
+func TestRewriteDropsAPeerGentilityRefuses(t *testing.T) {
+	for _, refusal := range []error{registry.ErrUnknownNode, registry.ErrNotRendered} {
+		t.Run(refusal.Error(), func(t *testing.T) {
+			store := newFakeWorlds(map[string]*registry.World{
+				"1": world("1", "acme", "n1", []string{selfAddr},
+					registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+			})
+			store.errs["2"] = refusal
+
+			resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+			require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+			assert.Empty(t, resp.Peers)
+			assert.Equal(t, []tailcfg.NodeID{2}, resp.PeersRemoved)
+		})
+	}
+}
+
+// An answer that did not ARRIVE is not an answer. With nothing cached this
+// round says nothing about the peer: announcing a removal would tell the
+// client a revocation happened, on the evidence of a timeout.
+func TestRewriteSaysNothingAboutAPeerItCouldNotReach(t *testing.T) {
 	store := newFakeWorlds(map[string]*registry.World{
 		"1": world("1", "acme", "n1", []string{selfAddr},
 			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
@@ -209,7 +272,120 @@ func TestRewriteDropsAPeerWhoseWorldCannotBeRead(t *testing.T) {
 	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
 
 	assert.Empty(t, resp.Peers)
-	assert.Equal(t, []tailcfg.NodeID{2}, resp.PeersRemoved)
+	assert.Empty(t, resp.PeersRemoved, "a transient failure is not a revocation")
+}
+
+// With something cached, a transient failure serves the peer as last seen —
+// the same stale-but-sealed rule the node's own World follows.
+func TestRewriteServesAPeerAsLastSeenThroughAnOutage(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": world("2", "acme", "reached", []string{reachedAddr}),
+	})
+
+	tick := &clock{at: time.Now()}
+	m := newTestMapper(store)
+	m.now = tick.now
+
+	first := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, m.rewriteFromRegistry(types.NodeID(1), first))
+	require.Len(t, first.Peers, 1)
+
+	store.errs["2"] = errors.New("registry down")
+	tick.advance(2 * defaultWorldTTL)
+
+	again := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+	require.NoError(t, m.rewriteFromRegistry(types.NodeID(1), again))
+
+	require.Len(t, again.Peers, 1)
+	assert.Equal(t, []string{reachedAddr + "/128"}, prefixes(t, again.Peers[0]))
+	assert.Empty(t, again.PeersRemoved)
+	assert.Equal(t, 2, store.callsFor("2"), "the stale entry was re-fetched, then fallen back on")
+}
+
+// A cached World is a copy of a document that moves, so it goes stale on its
+// own even if no change event ever arrives.
+func TestRewriteRefetchesAPeerWorldPastItsTTL(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": world("2", "acme", "reached", []string{reachedAddr}),
+	})
+
+	tick := &clock{at: time.Now()}
+	m := newTestMapper(store)
+	m.now = tick.now
+
+	build := func() {
+		resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+		require.NoError(t, m.rewriteFromRegistry(types.NodeID(1), resp))
+		require.Len(t, resp.Peers, 1)
+	}
+
+	build()
+	tick.advance(defaultWorldTTL / 2)
+	build()
+	assert.Equal(t, 1, store.callsFor("2"), "inside the TTL the cache answers")
+
+	tick.advance(defaultWorldTTL)
+	build()
+	assert.Equal(t, 2, store.callsFor("2"), "past the TTL the document is read again")
+}
+
+// The seam B6's change stream invalidates by: an event names a node, and the
+// next map build reads that node's World afresh rather than waiting out a TTL.
+func TestInvalidateWorldForcesARefetch(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": world("2", "acme", "reached", []string{reachedAddr}),
+	})
+
+	m := newTestMapper(store)
+
+	build := func() {
+		resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")}}
+		require.NoError(t, m.rewriteFromRegistry(types.NodeID(1), resp))
+		require.Len(t, resp.Peers, 1)
+	}
+
+	build()
+	build()
+	require.Equal(t, 1, store.callsFor("2"))
+
+	m.invalidateWorld(types.NodeID(2))
+
+	build()
+	assert.Equal(t, 2, store.callsFor("2"))
+}
+
+// Every peer gets its own budget. One shared deadline across a map build means
+// the last peer in a large netmap is fetched with whatever the peers before it
+// left over, so a single slow answer silently drops the tail of the list.
+func TestRewriteGivesEveryPeerItsOwnBudget(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}},
+			registry.Filter{Src: selfAddr + "/128", Dst: unreachedddr + "/128", Ports: []int{443}}),
+		"2": world("2", "acme", "reached", []string{reachedAddr}),
+		"3": world("3", "acme", "second", []string{unreachedddr}),
+	})
+	store.slow["2"] = 60 * time.Millisecond
+
+	resp := &tailcfg.MapResponse{
+		Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2"), worldNode(3, "100.64.0.3")},
+	}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+	require.Len(t, resp.Peers, 2)
+
+	for _, id := range []string{"2", "3"} {
+		budget := store.budgetFor(id)
+		assert.LessOrEqual(t, budget, registryPeerTimeout,
+			"peer %s was handed more than a peer's budget, so the budget is shared", id)
+		assert.Greater(t, budget, registryPeerTimeout-50*time.Millisecond,
+			"peer %s paid for a slow peer before it", id)
+	}
 }
 
 // A patch names a peer the client already holds, so it is judged by the same

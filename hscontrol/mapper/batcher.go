@@ -49,6 +49,20 @@ func NewBatcher(batchTime time.Duration, workers int, mapper *mapper) *Batcher {
 	}
 }
 
+// InvalidateWorld forgets one node's cached World, so the next map response
+// built for it — or naming it as a peer — reads the document afresh.
+//
+// It is the seam the registry change stream drives: an event names a node, and
+// this is how that news reaches the rewrite without waiting out the cache's
+// TTL.
+func (b *Batcher) InvalidateWorld(nodeID types.NodeID) {
+	if b.mapper == nil || b.mapper.worldCache == nil {
+		return
+	}
+
+	b.mapper.invalidateWorld(nodeID)
+}
+
 // NewBatcherAndMapper creates a new [Batcher] with its [mapper].
 func NewBatcherAndMapper(cfg *types.Config, state *state.State) *Batcher {
 	m := newMapper(cfg, state)

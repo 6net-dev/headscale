@@ -615,8 +615,22 @@ func (m *mapper) keepVisiblePatches(
 	return kept
 }
 
-// applyWorldAddresses replaces a node's self addresses while preserving
-// its non-self AllowedIPs entries (subnet and exit routes).
+// applyWorldAddresses gives a node exactly the addresses its World names, as
+// /128s, and makes them the whole of its AllowedIPs.
+//
+// # There are no headscale-owned routes to preserve
+//
+// The v0 rewrite kept every non-self prefix the head had put in AllowedIPs —
+// subnet routes and exit-node advertisements. The World is the only source of
+// a node's addressing (design §4), and Gentility renders no routes: a reach
+// grant renders a /128-to-/128 path with a port, and nothing else. So there is
+// nothing left here to preserve, and what the old code preserved was the
+// node's own claim about what it could route.
+//
+// That claim is ignored rather than approved: a client is free to advertise
+// `--advertise-routes` or an exit node, and this head simply never renders it.
+// Keeping it would let a node widen its own reach by asking, on a surface
+// whose entire point is that reach comes from a grant.
 func applyWorldAddresses(node *tailcfg.Node, addrs []string) {
 	selfPrefixes := make([]netip.Prefix, 0, len(addrs))
 
@@ -631,19 +645,6 @@ func applyWorldAddresses(node *tailcfg.Node, addrs []string) {
 		selfPrefixes = append(selfPrefixes, netip.PrefixFrom(addr, addr.BitLen()))
 	}
 
-	oldSelf := make(map[netip.Prefix]bool, len(node.Addresses))
-	for _, p := range node.Addresses {
-		oldSelf[p] = true
-	}
-
-	var routes []netip.Prefix
-
-	for _, p := range node.AllowedIPs {
-		if !oldSelf[p] {
-			routes = append(routes, p)
-		}
-	}
-
 	node.Addresses = selfPrefixes
-	node.AllowedIPs = append(selfPrefixes[:len(selfPrefixes):len(selfPrefixes)], routes...)
+	node.AllowedIPs = selfPrefixes
 }

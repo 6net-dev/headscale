@@ -154,6 +154,17 @@ func prefixes(t *testing.T, node *tailcfg.Node) []string {
 	return out
 }
 
+func allowedIPs(t *testing.T, node *tailcfg.Node) []string {
+	t.Helper()
+
+	out := make([]string, 0, len(node.AllowedIPs))
+	for _, prefix := range node.AllowedIPs {
+		out = append(out, prefix.String())
+	}
+
+	return out
+}
+
 func peerIDs(peers []*tailcfg.Node) []int64 {
 	out := make([]int64, 0, len(peers))
 	for _, peer := range peers {
@@ -421,6 +432,57 @@ func TestRewriteLeavesANilPeerListNil(t *testing.T) {
 
 	assert.Nil(t, resp.Peers)
 	assert.Nil(t, resp.PeersChanged)
+}
+
+// A client that advertises a subnet route or an exit node is advertising
+// something this head has no way to authorize: the World is the only source of
+// a node's addresses, and Gentility renders no routes. So the advertisement is
+// ignored — not approved, not rendered — and the node's own AllowedIPs come
+// back as exactly its World addresses.
+func TestRewriteIgnoresAdvertisedRoutes(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr}),
+	})
+
+	node := worldNode(1, "100.64.0.1")
+	node.AllowedIPs = []netip.Prefix{
+		node.Addresses[0],
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	resp := &tailcfg.MapResponse{Node: node}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.Equal(t, []string{selfAddr + "/128"}, allowedIPs(t, resp.Node),
+		"a node's AllowedIPs are its World addresses and nothing else")
+	assert.Equal(t, []string{selfAddr + "/128"}, prefixes(t, resp.Node))
+}
+
+// The same rule seen from the other side: whatever a peer advertised, its
+// peers are told only what the World says it holds. A subnet route surviving
+// here would route a whole network through a node on the strength of that
+// node's own claim.
+func TestRewriteGivesPeersOnlyTheirWorldAddresses(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr},
+			registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}}),
+		"2": world("2", "acme", "reached", []string{reachedAddr}),
+	})
+
+	peer := worldNode(2, "100.64.0.2")
+	peer.AllowedIPs = []netip.Prefix{
+		peer.Addresses[0],
+		netip.MustParsePrefix("192.168.0.0/16"),
+	}
+
+	resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1"), Peers: []*tailcfg.Node{peer}}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, []string{reachedAddr + "/128"}, allowedIPs(t, resp.Peers[0]),
+		"a peer's advertised subnet route is not the head's to render")
 }
 
 // One name, several answers, no type: the record set is what design §13 asks

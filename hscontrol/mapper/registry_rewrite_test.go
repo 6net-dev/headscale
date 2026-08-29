@@ -872,7 +872,17 @@ func TestRewriteLeavesTheDERPMapAloneWhenTheWorldSendsNone(t *testing.T) {
 // An explicit null is the same absence, and a document this head cannot parse
 // is not a reason to strand every node with no relay at all.
 func TestRewriteKeepsTheDERPMapOnAnUnreadableOne(t *testing.T) {
-	for _, raw := range []string{`null`, `"not a derp map"`} {
+	for _, raw := range []string{
+		`null`,
+		`"not a derp map"`,
+
+		// An EMPTY region set. It parses cleanly into a non-nil map, so
+		// the nil check alone let it through and installed a relay list
+		// with no relays in it — a node with a stale relay can still
+		// reach one, and a node with none can reach nothing.
+		`{"Regions":{}}`,
+		`{}`,
+	} {
 		self := world("1", "acme", "n1", []string{selfAddr})
 		self.DERPMap = json.RawMessage(raw)
 

@@ -803,9 +803,13 @@ func applyWorldDERPMap(resp *tailcfg.MapResponse, world *registry.World) {
 		return
 	}
 
-	// "null" parses without error into the zero value; it is an absent map
-	// rather than an empty one.
-	if derpMap.Regions == nil && derpMap.HomeParams == nil {
+	// An absent map, and an empty one, which are the same instruction: none
+	// at all. "null" parses without error into the zero value, and
+	// {"Regions":{}} parses into a non-nil map with nothing in it — so the
+	// LENGTH is what has to be checked, not the nil-ness. Installing an
+	// empty region set would leave every node with no relay to reach, which
+	// is the one outcome this function's fallbacks exist to avoid.
+	if len(derpMap.Regions) == 0 && derpMap.HomeParams == nil {
 		return
 	}
 

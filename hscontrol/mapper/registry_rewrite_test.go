@@ -10,6 +10,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -697,4 +698,34 @@ func TestRewriteKeepsTheHeadsNameWhenNoOrgNameMatches(t *testing.T) {
 
 	require.Len(t, resp.Peers, 1)
 	assert.Equal(t, "stale.example.", resp.Peers[0].Name)
+}
+
+// Withholding is silent by construction — the async path logs and drops, and
+// the node simply keeps the netmap it has — so the counter is the only way an
+// operator sees it happening at all.
+func TestRewriteCountsAWithheldResponse(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{})
+	store.errs["1"] = errors.New("registry down")
+
+	before := testutil.ToFloat64(registryRewriteWithheld)
+
+	resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1")}
+	require.Error(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.InDelta(t, before+1, testutil.ToFloat64(registryRewriteWithheld), 0.0,
+		"a withheld response must be countable")
+}
+
+// A rewrite that succeeds counts nothing.
+func TestRewriteCountsNothingWhenItSeals(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr}),
+	})
+
+	before := testutil.ToFloat64(registryRewriteWithheld)
+
+	resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1")}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.InDelta(t, before, testutil.ToFloat64(registryRewriteWithheld), 0.0)
 }

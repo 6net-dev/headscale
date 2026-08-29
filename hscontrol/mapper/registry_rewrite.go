@@ -11,6 +11,8 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
 )
@@ -35,6 +37,16 @@ const (
 	// hour ago.
 	defaultWorldTTL = 60 * time.Second
 )
+
+// registryRewriteWithheld counts the map responses the rewrite refused to let
+// out. See the fail-closed note on [mapper.rewriteFromRegistry]: the node
+// keeps its last netmap and is told nothing, so this counter is the whole of
+// the signal.
+var registryRewriteWithheld = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: "headscale",
+	Name:      "registry_rewrite_withheld_total",
+	Help:      "total count of map responses withheld because no sealed world could be applied",
+})
 
 // cachedWorld is one remembered document and when it was read, since a copy of
 // something that moves is only as good as its age.
@@ -72,6 +84,28 @@ const (
 // stale-but-sealed netmap beats a fresh one that violates the org
 // seam.
 //
+// # What "withheld" means to the node
+//
+// An error here fails the whole map response. On the ASYNC path — every
+// change after the first map — [generateMapResponse] returns that error,
+// [Batcher] logs it, and the change is DROPPED. Nothing is retried and nothing
+// is sent, so the node simply keeps the netmap it already has until some later
+// change is rewritten successfully. That is the fail-closed choice made
+// visible: a node holding a slightly old sealed netmap is a node that is still
+// only talking to peers a reach grant allowed, whereas sending the head's own
+// unrewritten response would publish every device on the head to every other.
+//
+// It is not free, and it is silent by construction: no client sees an error
+// and no reconnect is triggered, so a registry that stays unreachable leaves
+// every node frozen at whatever it last held. [registryRewriteWithheld] is how
+// an operator sees it happening — a rising counter is the only symptom, and
+// the alert belongs on it rather than on the logs.
+//
+// The SYNCHRONOUS path is different: the initial map for a node that has just
+// connected has no last netmap to keep, so the error reaches the caller and
+// the session fails, which is the honest answer to "I cannot seal your first
+// map".
+//
 // # A World is keyed by the head's own node id
 //
 // Not by the node key, which the v0 rewrite used: a key rotates, and a
@@ -95,6 +129,8 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 
 	world, err := m.fetchWorld(nodeID)
 	if err != nil {
+		registryRewriteWithheld.Inc()
+
 		return err
 	}
 

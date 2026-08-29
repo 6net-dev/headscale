@@ -32,6 +32,11 @@ const worldV1 = `{
   "derp_map": {"regions": {"1": {"name": "embedded", "nodes": [{"host": "derp.example", "port": 443}]}}}
 }`
 
+// cursor is a persisted cursor as [Client.Changes] takes one. A nil cursor is
+// a different request — the tail — so the pointer is the distinction rather
+// than a sentinel number.
+func cursor(seq int64) *int64 { return &seq }
+
 // serve starts a test Gentility and returns a client pointed at it.
 func serve(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
@@ -253,7 +258,7 @@ func TestChangesReadsGentilitysFraming(t *testing.T) {
 		got       []Change
 	)
 
-	err := client.Changes(t.Context(), 40, ChangeHandler{
+	err := client.Changes(t.Context(), cursor(40), ChangeHandler{
 		Connected: func() { connected++ },
 		Changed:   func(c Change) { got = append(got, c) },
 	})
@@ -279,7 +284,7 @@ func TestChangesJoinsMultiLineData(t *testing.T) {
 
 	var got []Change
 
-	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
 		Changed: func(c Change) { got = append(got, c) },
 	}))
 	assert.Equal(t, []Change{{Seq: 9, HeadNodeID: "3", WorldRevision: 4}}, got)
@@ -296,7 +301,7 @@ func TestChangesAcceptsCRLFAndBareCR(t *testing.T) {
 
 	var got []Change
 
-	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
 		Changed: func(c Change) { got = append(got, c) },
 	}))
 	assert.Equal(t, []Change{
@@ -311,7 +316,7 @@ func TestChangesIgnoresKeepalivesAndUnknownFields(t *testing.T) {
 		io.WriteString(w, ": keepalive\n\n: keepalive\n\nevent: ping\nretry: 500\n\n")
 	})
 
-	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
 		Changed: func(Change) { t.Error("no event was sent") },
 	}))
 }
@@ -322,7 +327,7 @@ func TestChangesBehindHorizonCarriesTheHorizon(t *testing.T) {
 		fmt.Fprint(w, `{"error":"behind_horizon","compaction_horizon":512}`)
 	})
 
-	err := client.Changes(t.Context(), 1, ChangeHandler{
+	err := client.Changes(t.Context(), cursor(1), ChangeHandler{
 		Connected: func() { t.Error("a refused stream was never connected") },
 	})
 
@@ -348,7 +353,7 @@ func TestChangesStatuses(t *testing.T) {
 				w.WriteHeader(tt.status)
 			})
 
-			require.ErrorIs(t, client.Changes(t.Context(), 0, ChangeHandler{}), tt.want)
+			require.ErrorIs(t, client.Changes(t.Context(), cursor(0), ChangeHandler{}), tt.want)
 		})
 	}
 }
@@ -358,7 +363,7 @@ func TestChangesRefusesANegativeCursorWithoutCalling(t *testing.T) {
 		t.Error("a cursor Gentility would 422 was sent anyway")
 	})
 
-	require.ErrorIs(t, client.Changes(t.Context(), -1, ChangeHandler{}), ErrInvalidRequest)
+	require.ErrorIs(t, client.Changes(t.Context(), cursor(-1), ChangeHandler{}), ErrInvalidRequest)
 }
 
 // Cancelling is how the head stops following, and it is not a stream fault.
@@ -383,7 +388,7 @@ func TestChangesReturnsTheContextError(t *testing.T) {
 		cancel()
 	}()
 
-	err := client.Changes(ctx, 0, ChangeHandler{})
+	err := client.Changes(ctx, cursor(0), ChangeHandler{})
 	require.True(t, errors.Is(err, context.Canceled), "got %v", err)
 }
 
@@ -395,7 +400,76 @@ func TestChangesRefusesAnUndecodableEvent(t *testing.T) {
 		io.WriteString(w, "id: 1\ndata: not json\n\n")
 	})
 
-	err := client.Changes(t.Context(), 0, ChangeHandler{})
+	err := client.Changes(t.Context(), cursor(0), ChangeHandler{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decoding change event")
+}
+
+// A head with no persisted cursor has never applied an event, so it asks for
+// the TAIL rather than for everything the stream still holds: it is about to
+// full-refresh every World it caches on Connected, and replaying the backlog
+// would be work whose answer that refresh already has.
+func TestChangesOmitsSinceWithoutACursor(t *testing.T) {
+	var gotQuery string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+
+		io.WriteString(w, "id: 9\ndata: {\"seq\":9,\"head_node_id\":\"3\",\"world_revision\":4}\n\n")
+	})
+
+	var (
+		connected int
+		got       []Change
+	)
+
+	require.NoError(t, client.Changes(t.Context(), nil, ChangeHandler{
+		Connected: func() { connected++ },
+		Changed:   func(c Change) { got = append(got, c) },
+	}))
+
+	assert.Empty(t, gotQuery, "no cursor is an absent since, not since=0")
+	assert.Equal(t, 1, connected, "the tail subscriber still full-refreshes on connect")
+	assert.Equal(t, []Change{{Seq: 9, HeadNodeID: "3", WorldRevision: 4}}, got)
+}
+
+// A cursor of zero is a head that HAS one and has applied nothing, which is a
+// different request from having none at all.
+func TestChangesSendsAZeroCursor(t *testing.T) {
+	var gotQuery string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+	})
+
+	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{}))
+	assert.Equal(t, "since=0", gotQuery)
+}
+
+// Recovery from a 410 is a TAIL subscription, not since=0. The cursor is past
+// the horizon, so every seq below it is gone; asking for zero would ask
+// Gentility to replay from a point it has already compacted away and earn a
+// second 410, forever. The head full-refreshes instead and follows from now.
+func TestChangesRecoversFromTheHorizonWithoutACursor(t *testing.T) {
+	var queries []string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+
+		if len(queries) == 1 {
+			w.WriteHeader(http.StatusGone)
+			fmt.Fprint(w, `{"error":"behind_horizon","compaction_horizon":512}`)
+
+			return
+		}
+	})
+
+	err := client.Changes(t.Context(), cursor(7), ChangeHandler{})
+	require.ErrorIs(t, err, ErrBehindHorizon)
+
+	// What the head does next, as the doc comment on Changes prescribes.
+	require.NoError(t, client.Changes(t.Context(), nil, ChangeHandler{}))
+
+	assert.Equal(t, []string{"since=7", ""}, queries,
+		"recovery asks for the tail; since=0 would earn the same 410 forever")
 }

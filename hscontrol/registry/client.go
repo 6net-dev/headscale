@@ -220,7 +220,9 @@ func (c *Client) Rotate(ctx context.Context, rot Rotation) error {
 //
 // Connected is called once each time the stream opens, BEFORE any event —
 // that is the head's cue to refresh every World it has cached, since a
-// reconnect is exactly the window in which it may have missed one.
+// reconnect is exactly the window in which it may have missed one. It is what
+// makes a nil cursor safe: the refresh, not the backlog, is how a head with
+// no cursor catches up.
 // Changed is called for each event, in seq order.
 //
 // Both are called on the goroutine that called [Client.Changes], so neither
@@ -236,20 +238,37 @@ type ChangeHandler struct {
 // connection drops. A clean end of stream is not an error: the caller
 // reconnects with the cursor it has.
 //
-// since is always sent, because the head always has a cursor: zero is "replay
-// everything the stream still holds", which is what a head with no cache
-// wants, and a persisted cursor is what a head with one wants.
+// # A nil cursor is the tail, and it is not since=0
+//
+// since is a POINTER because "the cursor I persisted" and "I have no cursor"
+// are different requests, and no number can say the second. A nil since omits
+// the parameter and Gentility serves from now on; a non-nil one, zero
+// included, replays from that seq.
+//
+// A head with no persisted cursor — a cold start, a lost cache file — wants
+// the tail. It has cached no World, so there is no backlog whose effect it
+// missed, and its Connected handler full-refreshes every World it does hold
+// before a single event is served. Replaying the stream's whole history into
+// that would be work whose answer the refresh already has.
+//
+// # Recovery from the horizon asks for the tail too
 //
 // A cursor below the compaction horizon is answered [ErrBehindHorizon] — as a
 // [BehindHorizonError] carrying the horizon — before any event is delivered.
-// The head clears its cursor, full-refreshes every cached World, and starts
-// again.
-func (c *Client) Changes(ctx context.Context, since int64, h ChangeHandler) error {
-	if since < 0 {
-		return fmt.Errorf("registry: %w: negative cursor %d", ErrInvalidRequest, since)
+// The head then full-refreshes every cached World and reconnects with a NIL
+// cursor. Not since=0: every seq below the horizon is gone, so zero is a point
+// Gentility has already compacted away and it earns the same 410 again,
+// forever. The refresh is what brings the head level; the tail is what keeps
+// it there.
+func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) error {
+	if since != nil && *since < 0 {
+		return fmt.Errorf("registry: %w: negative cursor %d", ErrInvalidRequest, *since)
 	}
 
-	path := "/overlay/head/changes?since=" + strconv.FormatInt(since, 10)
+	path := "/overlay/head/changes"
+	if since != nil {
+		path += "?since=" + strconv.FormatInt(*since, 10)
+	}
 
 	req, err := c.request(ctx, http.MethodGet, path, nil)
 	if err != nil {

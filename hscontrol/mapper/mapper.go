@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -15,7 +16,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
-	"github.com/6net-dev/6net/registryclient"
+	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -50,17 +51,27 @@ type mapper struct {
 	cfg     *types.Config
 	batcher *Batcher
 
-	// regClient, when non-nil, makes the external registry
-	// authoritative for topology and addressing via
-	// [mapper.rewriteFromRegistry].
-	regClient *registryclient.Client
+	// regClient, when non-nil, makes Gentility authoritative for
+	// topology and addressing via [mapper.rewriteFromRegistry].
+	//
+	// It is an interface rather than the client itself because the
+	// rewrite uses exactly one call, and the rules it applies to a World
+	// are worth testing without a server to serve one.
+	regClient worldSource
 
 	// worldCache holds the last world seen per node so registry
-	// outages degrade to stale-but-sealed netmaps (fail-closed).
-	worldCache   map[types.NodeID]*registryclient.World
+	// outages degrade to stale-but-sealed netmaps (fail-closed), and so
+	// that a map build does not re-fetch every peer's document.
+	worldCache   map[types.NodeID]*registry.World
 	worldCacheMu sync.Mutex
 
 	created time.Time
+}
+
+// worldSource is Gentility as the rewrite uses it: one World, by head node
+// id. [registry.Client] is the implementation.
+type worldSource interface {
+	World(ctx context.Context, headNodeID string) (*registry.World, error)
 }
 
 //nolint:unused
@@ -82,8 +93,8 @@ func newMapper(
 	}
 
 	if cfg.RegistryURL != "" {
-		m.regClient = registryclient.New(cfg.RegistryURL)
-		m.worldCache = make(map[types.NodeID]*registryclient.World)
+		m.regClient = registry.New(cfg.RegistryURL, cfg.RegistryBearer)
+		m.worldCache = make(map[types.NodeID]*registry.World)
 	}
 
 	return m

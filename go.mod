@@ -3,7 +3,6 @@ module github.com/juanfont/headscale
 go 1.26.5
 
 require (
-	github.com/6net-dev/6net v0.1.0
 	github.com/arl/statsviz v0.8.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/chasefleming/elem-go v0.31.0

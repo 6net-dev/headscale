@@ -1,6 +1,24 @@
 package registry
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
+
+// NodeID renders a head node id the way this channel names one: the decimal
+// form of the id the head allocated for the node.
+//
+// It is the key of every call here — the World is fetched by it, and the
+// registration callback reports it — because it is the one name for a node
+// that does not move. A node key rotates; a document keyed by one would move
+// when nothing about the node did.
+//
+// The id therefore has to EXIST before the head talks about the node at all,
+// which is why the registration callback belongs inside the write that
+// allocates it and after the insert, not before and not after the commit.
+func NodeID(id uint64) string {
+	return strconv.FormatUint(id, 10)
+}
 
 // World is the document Gentility renders for one head node and the head
 // rewrites its netmaps from. v1; see

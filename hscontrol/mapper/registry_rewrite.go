@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"strings"
+	"slices"
 	"time"
 
-	"github.com/6net-dev/6net/registryclient"
+	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
@@ -15,51 +15,50 @@ import (
 
 const registryWorldTimeout = 3 * time.Second
 
-// rewriteFromRegistry makes the registry authoritative for topology,
-// addressing, naming, DNS, and filters: the World(device) contract is
-// applied to every outbound MapResponse. The wire head stays
-// authoritative for transport (endpoints, disco keys, online).
+// rewriteFromRegistry makes Gentility authoritative for topology,
+// addressing, naming, DNS, and filters: the World contract is applied to
+// every outbound MapResponse. The wire head stays authoritative for
+// transport (endpoints, disco keys, online).
 //
 // Fail-closed: on registry errors the last known world for the node is
 // used; with no cached world the response is withheld entirely — a
 // stale-but-sealed netmap beats a fresh one that violates the org
 // seam.
+//
+// # A World is keyed by the head's own node id
+//
+// Not by the node key, which the v0 rewrite used: a key rotates, and a
+// document keyed by one would move when nothing about the node did. The id
+// the head allocates is the node's identity on this channel from the moment
+// it exists, which is also why the registration callback belongs after the
+// insert that allocates it — see [registry.NodeID].
+//
+// # Peers are derived from the filters
+//
+// The World carries no peer list (master §2.4). The visible peer set is
+// every address named as a filter's source or destination, less this node's
+// own; a peer is kept only when its OWN World holds one of those addresses,
+// and its addresses and names are read from that World. So a peer nothing
+// can reach is a peer this node is never told about, and there is no second
+// place where a peer's identity is written down.
 func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapResponse) error {
 	if m.regClient == nil || resp == nil {
-		return nil
-	}
-
-	nv, ok := m.state.GetNodeByID(nodeID)
-	if !ok {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), registryWorldTimeout)
 	defer cancel()
 
-	world, err := m.regClient.World(ctx, nv.NodeKey().String())
+	world, err := m.fetchWorld(ctx, nodeID)
 	if err != nil {
-		world = m.cachedWorld(nodeID)
-		if world == nil {
-			return fmt.Errorf("registry unreachable and no cached world for node %d: %w", nodeID, err)
-		}
-
-		log.Warn().
-			Err(err).
-			Uint64("node.id", nodeID.Uint64()).
-			Msg("registry world fetch failed; serving cached world")
-	} else {
-		m.cacheWorld(nodeID, world)
+		return err
 	}
 
-	byKey := make(map[string]registryclient.Peer, len(world.Peers))
-	for _, peer := range world.Peers {
-		byKey[peer.NodeKey] = peer
-	}
+	visible := visibleAddresses(world)
 
 	if resp.Node != nil {
-		applyWorldAddresses(resp.Node, world.Self.Addresses)
-		applyWorldName(resp.Node, world.Self.Entries)
+		applyWorldAddresses(resp.Node, world.Addresses)
+		applyWorldName(resp.Node, world.Names, m.baseDomain())
 	}
 
 	// Peers dropped by the rewrite must be announced in PeersRemoved:
@@ -67,88 +66,202 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 	// change", so silence would leave stale peers on the client.
 	var removed []tailcfg.NodeID
 
-	resp.Peers, removed = rewriteWorldPeers(resp.Peers, byKey, removed)
-	resp.PeersChanged, removed = rewriteWorldPeers(resp.PeersChanged, byKey, removed)
+	resp.Peers, removed = m.rewriteWorldPeers(ctx, resp.Peers, visible, removed)
+	resp.PeersChanged, removed = m.rewriteWorldPeers(ctx, resp.PeersChanged, visible, removed)
 	resp.PeersRemoved = append(resp.PeersRemoved, removed...)
+	resp.PeersChangedPatch = m.keepVisiblePatches(ctx, resp.PeersChangedPatch, visible)
 
-	if len(resp.PeersChangedPatch) > 0 {
-		kept := resp.PeersChangedPatch[:0]
-
-		for _, patch := range resp.PeersChangedPatch {
-			pnv, ok := m.state.GetNodeByID(types.NodeID(patch.NodeID)) //nolint:gosec // IDs are bounded
-			if !ok {
-				continue
-			}
-
-			if _, inWorld := byKey[pnv.NodeKey().String()]; inWorld {
-				kept = append(kept, patch)
-			}
-		}
-
-		resp.PeersChangedPatch = kept
-	}
-
-	applyWorldDNS(resp, world)
+	applyWorldDNS(resp, world, m.baseDomain())
 	applyWorldFilters(resp, world)
 
 	return nil
 }
 
-func (m *mapper) cachedWorld(nodeID types.NodeID) *registryclient.World {
+func (m *mapper) baseDomain() string {
+	if m.cfg == nil {
+		return ""
+	}
+
+	return m.cfg.BaseDomain
+}
+
+// fetchWorld reads a node's own World fresh, because it is the document this
+// map is being rewritten from. A registry that cannot be reached degrades to
+// the last World seen for that node; a node with no cached World has no
+// document to be sealed against, and the caller withholds the response.
+func (m *mapper) fetchWorld(ctx context.Context, nodeID types.NodeID) (*registry.World, error) {
+	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
+	if err == nil {
+		if verr := supportedWorld(world); verr != nil {
+			return nil, verr
+		}
+
+		m.cacheWorld(nodeID, world)
+
+		return world, nil
+	}
+
+	cached := m.cachedWorld(nodeID)
+	if cached == nil {
+		return nil, fmt.Errorf("registry unreachable and no cached world for node %d: %w", nodeID, err)
+	}
+
+	log.Warn().
+		Err(err).
+		Uint64("node.id", nodeID.Uint64()).
+		Msg("registry world fetch failed; serving cached world")
+
+	return cached, nil
+}
+
+// peerWorld reads a peer's World, cache first: a map build touches every peer
+// and the change stream keeps the cache current, so a fetch per peer per map
+// would be the same document asked for over and over.
+//
+// A nil answer means this head cannot say where the peer lives, and the
+// caller drops it rather than guessing — the same fail-closed rule the node's
+// own World follows.
+func (m *mapper) peerWorld(ctx context.Context, nodeID types.NodeID) *registry.World {
+	if cached := m.cachedWorld(nodeID); cached != nil {
+		return cached
+	}
+
+	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
+	if err != nil {
+		log.Warn().
+			Err(err).
+			Uint64("peer.id", nodeID.Uint64()).
+			Msg("registry world fetch failed for peer; dropping it from the netmap")
+
+		return nil
+	}
+
+	if err := supportedWorld(world); err != nil {
+		log.Warn().Err(err).Uint64("peer.id", nodeID.Uint64()).Msg("dropping peer")
+
+		return nil
+	}
+
+	m.cacheWorld(nodeID, world)
+
+	return world
+}
+
+// supportedWorld refuses a renderer version this head was not built against.
+// A document whose shape we do not know is one we cannot enforce, and
+// enforcing it wrongly is worse than serving nothing.
+func supportedWorld(world *registry.World) error {
+	if world.RendererVersion != registry.RendererVersion1 {
+		return fmt.Errorf("registry: unsupported renderer version %d", world.RendererVersion)
+	}
+
+	return nil
+}
+
+func (m *mapper) cachedWorld(nodeID types.NodeID) *registry.World {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
 
 	return m.worldCache[nodeID]
 }
 
-func (m *mapper) cacheWorld(nodeID types.NodeID, world *registryclient.World) {
+func (m *mapper) cacheWorld(nodeID types.NodeID, world *registry.World) {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
 
 	m.worldCache[nodeID] = world
 }
 
-// applyWorldDNS installs the world's org search domains and adds AAAA
-// records for every org-scoped name beyond a node's primary one, so
-// `host.org.base` resolves per org even when a device is named in
-// several orgs at once.
-func applyWorldDNS(resp *tailcfg.MapResponse, world *registryclient.World) {
+// visibleAddresses is the peer set, derived: every address a filter names as
+// a source or a destination, less the node's own. A filter is the only thing
+// that can put an address here, so a node sees exactly what it has a rendered
+// path to or from.
+func visibleAddresses(world *registry.World) map[netip.Addr]bool {
+	visible := make(map[netip.Addr]bool, 2*len(world.Filters))
+
+	for _, filter := range world.Filters {
+		for _, prefix := range []string{filter.Src, filter.Dst} {
+			addr, err := netip.ParsePrefix(prefix)
+			if err != nil {
+				log.Warn().Str("prefix", prefix).Msg("world filter carried an unparsable prefix")
+
+				continue
+			}
+
+			visible[addr.Addr()] = true
+		}
+	}
+
+	for _, own := range world.Addresses {
+		addr, err := netip.ParseAddr(own)
+		if err != nil {
+			log.Warn().Str("addr", own).Msg("world carried an unparsable address")
+
+			continue
+		}
+
+		delete(visible, addr)
+	}
+
+	return visible
+}
+
+// holdsVisibleAddress reports whether any of a peer's own addresses is one
+// this node has a path to.
+func holdsVisibleAddress(world *registry.World, visible map[netip.Addr]bool) bool {
+	return slices.ContainsFunc(world.Addresses, func(own string) bool {
+		addr, err := netip.ParseAddr(own)
+
+		return err == nil && visible[addr]
+	})
+}
+
+// applyWorldDNS installs the search domains for every organization the node
+// is named in, and the World's own records for the platform hostname.
+//
+// The records carry a NAME and an ADDRESS and no type (design §13): the
+// pinned client ignores an extra record whose type is non-empty, so the v0
+// rewrite's "AAAA" was silently dropped. Several records may share one name —
+// one per organization, each naming that organization's own gateway — and
+// that is the point rather than a duplication.
+func applyWorldDNS(resp *tailcfg.MapResponse, world *registry.World, baseDomain string) {
 	if resp.DNSConfig == nil {
 		return
 	}
 
-	resp.DNSConfig.Domains = world.DNS.SearchDomains
+	resp.DNSConfig.Domains = searchDomains(world.Names, baseDomain)
 
-	var extra []tailcfg.DNSRecord
-
-	extra = appendSecondaryRecords(extra, world.Self.Entries)
-	for _, peer := range world.Peers {
-		extra = appendSecondaryRecords(extra, peer.Entries)
+	records := make([]tailcfg.DNSRecord, 0, len(world.DNS))
+	for _, record := range world.DNS {
+		records = append(records, tailcfg.DNSRecord{Name: record.Name, Value: record.Addr})
 	}
 
-	resp.DNSConfig.ExtraRecords = extra
+	resp.DNSConfig.ExtraRecords = records
 }
 
-func appendSecondaryRecords(records []tailcfg.DNSRecord, entries []registryclient.WorldEntry) []tailcfg.DNSRecord {
-	for i, entry := range entries {
-		if i == 0 {
-			continue // primary name is carried by Node.Name
+// searchDomains is one domain per organization the node is named in, in the
+// order the World lists them — which is the renderer's organization order, so
+// a node's primary organization is searched first.
+func searchDomains(names []registry.Name, baseDomain string) []string {
+	if baseDomain == "" {
+		return nil
+	}
+
+	domains := make([]string, 0, len(names))
+
+	for _, name := range names {
+		domain := name.Org + "." + baseDomain
+		if !slices.Contains(domains, domain) {
+			domains = append(domains, domain)
 		}
-
-		records = append(records, tailcfg.DNSRecord{
-			Name:  entry.FQDN,
-			Type:  "AAAA",
-			Value: entry.Address,
-		})
 	}
 
-	return records
+	return domains
 }
 
-// applyWorldFilters replaces the head's packet filter with the
-// world's org-scoped rules: traffic flows inside an org's prefix and
-// nowhere else.
-func applyWorldFilters(resp *tailcfg.MapResponse, world *registryclient.World) {
+// applyWorldFilters replaces the head's packet filter with the World's rules:
+// traffic flows where a reach grant says it may and nowhere else.
+func applyWorldFilters(resp *tailcfg.MapResponse, world *registry.World) {
 	if resp.PacketFilters == nil {
 		return
 	}
@@ -166,21 +279,26 @@ func applyWorldFilters(resp *tailcfg.MapResponse, world *registryclient.World) {
 	resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": rules}
 }
 
-func applyWorldName(node *tailcfg.Node, entries []registryclient.WorldEntry) {
-	if len(entries) == 0 {
+// applyWorldName names a node inside its first organization — the World lists
+// them in the renderer's organization order, so the first is the node's
+// primary one. A node named in no organization keeps whatever the head gave
+// it, because a name assembled from nothing is not a name.
+func applyWorldName(node *tailcfg.Node, names []registry.Name, baseDomain string) {
+	if len(names) == 0 || baseDomain == "" {
 		return
 	}
 
-	node.Name = strings.TrimSuffix(entries[0].FQDN, ".") + "."
+	node.Name = names[0].Label + "." + names[0].Org + "." + baseDomain + "."
 }
 
-// rewriteWorldPeers drops peers the world does not contain (recording
-// them in removed) and rewrites the addresses and names of those it
-// does. A nil slice stays nil — deltas rely on the nil/empty
+// rewriteWorldPeers keeps the peers the World's filters make visible, reading
+// each one's addresses and names from that peer's own World, and records the
+// rest in removed. A nil slice stays nil — deltas rely on the nil/empty
 // distinction.
-func rewriteWorldPeers(
+func (m *mapper) rewriteWorldPeers(
+	ctx context.Context,
 	peers []*tailcfg.Node,
-	byKey map[string]registryclient.Peer,
+	visible map[netip.Addr]bool,
 	removed []tailcfg.NodeID,
 ) ([]*tailcfg.Node, []tailcfg.NodeID) {
 	if peers == nil {
@@ -190,18 +308,44 @@ func rewriteWorldPeers(
 	kept := peers[:0]
 
 	for _, peer := range peers {
-		worldPeer, ok := byKey[peer.Key.String()]
-		if !ok {
+		world := m.peerWorld(ctx, types.NodeID(peer.ID)) //nolint:gosec // IDs are bounded
+		if world == nil || !holdsVisibleAddress(world, visible) {
 			removed = append(removed, peer.ID)
+
 			continue
 		}
 
-		applyWorldAddresses(peer, worldPeer.Addresses)
-		applyWorldName(peer, worldPeer.Entries)
+		applyWorldAddresses(peer, world.Addresses)
+		applyWorldName(peer, world.Names, m.baseDomain())
 		kept = append(kept, peer)
 	}
 
 	return kept, removed
+}
+
+// keepVisiblePatches drops a delta for a peer the World does not make
+// visible. A patch names a peer the client already holds, so it is judged by
+// the same rule the peer itself was, and never by whether it happens to
+// appear in this response.
+func (m *mapper) keepVisiblePatches(
+	ctx context.Context,
+	patches []*tailcfg.PeerChange,
+	visible map[netip.Addr]bool,
+) []*tailcfg.PeerChange {
+	if len(patches) == 0 {
+		return patches
+	}
+
+	kept := patches[:0]
+
+	for _, patch := range patches {
+		world := m.peerWorld(ctx, types.NodeID(patch.NodeID)) //nolint:gosec // IDs are bounded
+		if world != nil && holdsVisibleAddress(world, visible) {
+			kept = append(kept, patch)
+		}
+	}
+
+	return kept
 }
 
 // applyWorldAddresses replaces a node's self addresses while preserving
@@ -213,6 +357,7 @@ func applyWorldAddresses(node *tailcfg.Node, addrs []string) {
 		addr, err := netip.ParseAddr(a)
 		if err != nil {
 			log.Warn().Str("addr", a).Msg("registry world contained unparsable address")
+
 			continue
 		}
 

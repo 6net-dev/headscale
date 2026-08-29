@@ -33,6 +33,7 @@ const (
 
 var (
 	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errRegistryBearerExclusive   = errors.New("registry.bearer and registry.bearer_path are mutually exclusive")
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
@@ -95,20 +96,26 @@ type NodeConfig struct {
 
 // Config contains the initial Headscale configuration.
 type Config struct {
-	ServerURL           string
-	Addr                string
-	MetricsAddr         string
-	GRPCAddr            string
-	GRPCAllowInsecure   bool
-	TrustedProxies      []netip.Prefix
-	Node                NodeConfig
-	PrefixV4            *netip.Prefix
-	PrefixV6            *netip.Prefix
+	ServerURL         string
+	Addr              string
+	MetricsAddr       string
+	GRPCAddr          string
+	GRPCAllowInsecure bool
+	TrustedProxies    []netip.Prefix
+	Node              NodeConfig
+	PrefixV4          *netip.Prefix
+	PrefixV6          *netip.Prefix
 
 	// RegistryURL, when set, makes the external registry authoritative
 	// for topology and addressing: netmaps are rewritten from its
 	// World(device) contract and registrations are reported to it.
 	RegistryURL string
+
+	// RegistryBearer is the shared secret carried as the bearer on every
+	// call of the head <-> registry channel, in both directions. Resolved
+	// by resolveRegistryBearer.
+	RegistryBearer string `json:"-"` // never serialise the registry secret
+
 	IPAllocation        IPAllocationStrategy
 	NoisePrivateKeyPath string
 	BaseDomain          string
@@ -1103,6 +1110,40 @@ func LoadCLIConfig() (*Config, error) {
 	}, nil
 }
 
+// resolveRegistryBearer reads the shared secret the head authenticates to the
+// registry with, in the order a deployment can supply it: the REGISTRY_BEARER
+// environment variable, then a file named by registry.bearer_path, then the
+// literal registry.bearer.
+//
+// The environment variable wins because it is what an orchestrator injects
+// over whatever the baked-in config file says. The file exists because a
+// secret passed on a command line is a secret in ps; the two config keys are
+// mutually exclusive for the same reason oidc_client_secret and its path are —
+// two answers to one question is a deployment nobody can read.
+func resolveRegistryBearer() (string, error) {
+	if bearer := os.Getenv("REGISTRY_BEARER"); bearer != "" {
+		return bearer, nil
+	}
+
+	bearer := viper.GetString("registry.bearer")
+
+	path := viper.GetString("registry.bearer_path")
+	if path == "" {
+		return bearer, nil
+	}
+
+	if bearer != "" {
+		return "", errRegistryBearerExclusive
+	}
+
+	secret, err := os.ReadFile(os.ExpandEnv(path))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(secret)), nil
+}
+
 // LoadServerConfig returns the full Headscale configuration to
 // host a Headscale server. This is called as part of `headscale serve`.
 func LoadServerConfig() (*Config, error) {
@@ -1196,6 +1237,11 @@ func LoadServerConfig() (*Config, error) {
 		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
+	registryBearer, err := resolveRegistryBearer()
+	if err != nil {
+		return nil, err
+	}
+
 	serverURL := viper.GetString("server_url")
 
 	// BaseDomain cannot be the same as the server URL.
@@ -1221,10 +1267,11 @@ func LoadServerConfig() (*Config, error) {
 		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
-		PrefixV4:     prefix4,
-		PrefixV6:     prefix6,
-		RegistryURL:  viper.GetString("registry.url"),
-		IPAllocation: alloc,
+		PrefixV4:       prefix4,
+		PrefixV6:       prefix6,
+		RegistryURL:    viper.GetString("registry.url"),
+		RegistryBearer: registryBearer,
+		IPAllocation:   alloc,
 
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
 			viper.GetString("noise.private_key_path"),

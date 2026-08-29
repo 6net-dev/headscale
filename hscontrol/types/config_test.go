@@ -486,6 +486,7 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 		secretPostgresPass = "p0stgres-secret-marker"
 		secretClientSecret = "oidc-client-secret-marker"    //nolint:gosec // test marker, not a real credential
 		secretAPIKey       = "headscale-cli-api-key-marker" //nolint:gosec // test marker, not a real credential
+		secretRegistry     = "registry-bearer-marker"       //nolint:gosec // test marker, not a real credential
 	)
 
 	cfg := &Config{
@@ -500,13 +501,14 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 		CLI: CLIConfig{
 			APIKey: secretAPIKey,
 		},
+		RegistryBearer: secretRegistry,
 	}
 
 	out, err := json.Marshal(cfg)
 	require.NoError(t, err)
 
 	body := string(out)
-	for _, secret := range []string{secretPostgresPass, secretClientSecret, secretAPIKey} {
+	for _, secret := range []string{secretPostgresPass, secretClientSecret, secretAPIKey, secretRegistry} {
 		assert.NotContains(t, body, secret,
 			"marshalled Config must not contain secret %q", secret)
 	}

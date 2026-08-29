@@ -1,0 +1,400 @@
+package registry
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const testBearer = "overlay-head-shared-secret-marker" //nolint:gosec // test marker, not a real credential
+
+// worldV1 is master §2.4's example document, verbatim. It is the fixture
+// rather than a hand-rolled map because the point of this test is that the
+// document Gentility renders decodes here without amendment.
+const worldV1 = `{
+  "renderer_version": 1,
+  "revision": 17,
+  "head_node_id": "3",
+  "addresses": ["fd7a:115c:a1e0:1::a", "fd7a:115c:a1e0:2::a"],
+  "names": [{"org": "acme", "label": "n1"}, {"org": "beta", "label": "n1"}],
+  "dns": [{"name": "gentility-overlay.internal", "addr": "fd7a:115c:a1e0:1::1"},
+          {"name": "gentility-overlay.internal", "addr": "fd7a:115c:a1e0:2::1"}],
+  "filters": [{"src": "fd7a:115c:a1e0:1::a/128", "dst": "fd7a:115c:a1e0:1::1/128", "ports": [443]}],
+  "derp_map": {"regions": {"1": {"name": "embedded", "nodes": [{"host": "derp.example", "port": 443}]}}}
+}`
+
+// serve starts a test Gentility and returns a client pointed at it.
+func serve(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	return New(server.URL, testBearer)
+}
+
+func TestWorldDecodesTheV1Document(t *testing.T) {
+	var gotPath, gotAuth, gotMethod string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth, gotMethod = r.URL.Path, r.Header.Get("Authorization"), r.Method
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, worldV1)
+	})
+
+	world, err := client.World(t.Context(), "3")
+	require.NoError(t, err)
+
+	assert.Equal(t, "/overlay/head/world/3", gotPath)
+	assert.Equal(t, "Bearer "+testBearer, gotAuth)
+	assert.Equal(t, http.MethodGet, gotMethod)
+
+	assert.Equal(t, RendererVersion1, world.RendererVersion)
+	assert.Equal(t, int64(17), world.Revision)
+	assert.Equal(t, "3", world.HeadNodeID)
+	assert.Equal(t, []string{"fd7a:115c:a1e0:1::a", "fd7a:115c:a1e0:2::a"}, world.Addresses)
+	assert.Equal(t, []Name{{Org: "acme", Label: "n1"}, {Org: "beta", Label: "n1"}}, world.Names)
+
+	// Several records for one name is the contract, not a duplication.
+	require.Len(t, world.DNS, 2)
+	assert.Equal(t, world.DNS[0].Name, world.DNS[1].Name)
+	assert.Equal(t, "fd7a:115c:a1e0:2::1", world.DNS[1].Addr)
+	assert.Empty(t, world.DNS[0].Type, "a rendered record carries no type (design §13)")
+
+	assert.Equal(t,
+		[]Filter{{
+			Src:   "fd7a:115c:a1e0:1::a/128",
+			Dst:   "fd7a:115c:a1e0:1::1/128",
+			Ports: []int{443},
+		}},
+		world.Filters)
+
+	assert.JSONEq(t,
+		`{"regions":{"1":{"name":"embedded","nodes":[{"host":"derp.example","port":443}]}}}`,
+		string(world.DERPMap))
+}
+
+func TestWorldEscapesTheHeadNodeIDInThePath(t *testing.T) {
+	var gotPath string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	_, err := client.World(t.Context(), "3/../7")
+	require.ErrorIs(t, err, ErrUnknownNode)
+	assert.Equal(t, "/overlay/head/world/3%2F..%2F7", gotPath)
+}
+
+func TestWorldStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"unknown or revoked node", http.StatusNotFound, ErrUnknownNode},
+		{"nothing rendered yet", http.StatusConflict, ErrNotRendered},
+		{"not the head", http.StatusUnauthorized, ErrUnauthorized},
+		{"too many calls", http.StatusTooManyRequests, ErrRateLimited},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				fmt.Fprint(w, `{"error":"whatever"}`)
+			})
+
+			_, err := client.World(t.Context(), "3")
+			require.ErrorIs(t, err, tt.want)
+		})
+	}
+}
+
+func TestRegisterSendsTheContractBodyAndDecodesTheWorld(t *testing.T) {
+	var got Registration
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/overlay/head/register", r.URL.Path)
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "Bearer "+testBearer, r.Header.Get("Authorization"))
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+
+		fmt.Fprintf(w, `{"node_id":"01920000-0000-7000-8000-000000000001","world":%s}`, worldV1)
+	})
+
+	sent := Registration{
+		PreauthKeyID: "pak-1",
+		NodeKey:      "nodekey:abc",
+		MachineKey:   "mkey:def",
+		HeadNodeID:   "3",
+	}
+
+	result, err := client.Register(t.Context(), sent)
+	require.NoError(t, err)
+
+	assert.Equal(t, sent, got)
+	assert.Equal(t, "01920000-0000-7000-8000-000000000001", result.NodeID)
+	require.NotNil(t, result.World)
+	assert.Equal(t, int64(17), result.World.Revision)
+}
+
+// A first registration's render is queued in the transaction that has just
+// committed, so there is no World to hand back yet. That is a null, not a
+// failure, and not an empty document either.
+func TestRegisterAcceptsANullWorld(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"node_id":"01920000-0000-7000-8000-000000000002","world":null}`)
+	})
+
+	result, err := client.Register(t.Context(), Registration{})
+	require.NoError(t, err)
+	assert.Equal(t, "01920000-0000-7000-8000-000000000002", result.NodeID)
+	assert.Nil(t, result.World)
+}
+
+func TestRegisterStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"unknown pre-auth key", http.StatusNotFound, ErrUnknownKey},
+		{"spent pre-auth key", http.StatusGone, ErrExpired},
+		{"compromised", http.StatusForbidden, ErrCompromised},
+		{"contradicts the record", http.StatusConflict, ErrRefused},
+		{"malformed", http.StatusUnprocessableEntity, ErrInvalidRequest},
+		{"not the head", http.StatusUnauthorized, ErrUnauthorized},
+		{"too many calls", http.StatusTooManyRequests, ErrRateLimited},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				fmt.Fprint(w, `{"error":"whatever"}`)
+			})
+
+			_, err := client.Register(t.Context(), Registration{})
+			require.ErrorIs(t, err, tt.want)
+		})
+	}
+}
+
+func TestRotateSendsTheContractBodyAndAcceptsNoContent(t *testing.T) {
+	var got Rotation
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/overlay/head/rotate", r.URL.Path)
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "Bearer "+testBearer, r.Header.Get("Authorization"))
+
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	sent := Rotation{HeadNodeID: "3", OldKey: "nodekey:old", NewKey: "nodekey:new"}
+	require.NoError(t, client.Rotate(t.Context(), sent))
+	assert.Equal(t, sent, got)
+}
+
+func TestRotateStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"unknown node", http.StatusNotFound, ErrUnknownNode},
+		{"contradicts the record", http.StatusConflict, ErrRefused},
+		{"malformed", http.StatusUnprocessableEntity, ErrInvalidRequest},
+		{"not the head", http.StatusUnauthorized, ErrUnauthorized},
+		{"too many calls", http.StatusTooManyRequests, ErrRateLimited},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+			})
+
+			require.ErrorIs(t, client.Rotate(t.Context(), Rotation{}), tt.want)
+		})
+	}
+}
+
+// The framing is Gentility's, byte for byte:
+// GentilityWeb.Overlay.HeadController writes "id: <seq>\ndata: <json>\n\n"
+// for an event and ": keepalive\n\n" for a heartbeat.
+func TestChangesReadsGentilitysFraming(t *testing.T) {
+	var gotQuery, gotAccept string
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery, gotAccept = r.URL.RawQuery, r.Header.Get("Accept")
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		io.WriteString(w, ": keepalive\n\n")
+		io.WriteString(w, "id: 41\ndata: {\"seq\":41,\"head_node_id\":\"3\",\"world_revision\":17}\n\n")
+		io.WriteString(w, ": keepalive\n\n")
+		io.WriteString(w, "id: 42\ndata: {\"seq\":42,\"head_node_id\":\"7\",\"world_revision\":2}\n\n")
+	})
+
+	var (
+		connected int
+		got       []Change
+	)
+
+	err := client.Changes(t.Context(), 40, ChangeHandler{
+		Connected: func() { connected++ },
+		Changed:   func(c Change) { got = append(got, c) },
+	})
+	require.NoError(t, err, "a clean end of stream is how a long poll ends")
+
+	assert.Equal(t, "since=40", gotQuery)
+	assert.Equal(t, "text/event-stream", gotAccept)
+	assert.Equal(t, 1, connected)
+	assert.Equal(t, []Change{
+		{Seq: 41, HeadNodeID: "3", WorldRevision: 17},
+		{Seq: 42, HeadNodeID: "7", WorldRevision: 2},
+	}, got)
+}
+
+// Nothing in the contract says a payload arrives on one line, and the SSE
+// rules join several data fields with a newline. A frame split mid-document
+// must decode to the same event.
+func TestChangesJoinsMultiLineData(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "id: 9\ndata: {\"seq\": 9,\ndata: \"head_node_id\": \"3\",\ndata: \"world_revision\": 4}\n\n")
+	})
+
+	var got []Change
+
+	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+		Changed: func(c Change) { got = append(got, c) },
+	}))
+	assert.Equal(t, []Change{{Seq: 9, HeadNodeID: "3", WorldRevision: 4}}, got)
+}
+
+// A proxy between the head and Gentility may normalise line endings; the SSE
+// rules accept CRLF, LF and a bare CR, and so does this reader.
+func TestChangesAcceptsCRLFAndBareCR(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, ": keepalive\r\n\r\n")
+		io.WriteString(w, "id: 1\r\ndata: {\"seq\":1,\"head_node_id\":\"3\",\"world_revision\":1}\r\n\r\n")
+		io.WriteString(w, "id: 2\rdata: {\"seq\":2,\"head_node_id\":\"3\",\"world_revision\":2}\r\r")
+	})
+
+	var got []Change
+
+	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+		Changed: func(c Change) { got = append(got, c) },
+	}))
+	assert.Equal(t, []Change{
+		{Seq: 1, HeadNodeID: "3", WorldRevision: 1},
+		{Seq: 2, HeadNodeID: "3", WorldRevision: 2},
+	}, got)
+}
+
+// A stream of nothing but heartbeats is a stream that is working.
+func TestChangesIgnoresKeepalivesAndUnknownFields(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, ": keepalive\n\n: keepalive\n\nevent: ping\nretry: 500\n\n")
+	})
+
+	require.NoError(t, client.Changes(t.Context(), 0, ChangeHandler{
+		Changed: func(Change) { t.Error("no event was sent") },
+	}))
+}
+
+func TestChangesBehindHorizonCarriesTheHorizon(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+		fmt.Fprint(w, `{"error":"behind_horizon","compaction_horizon":512}`)
+	})
+
+	err := client.Changes(t.Context(), 1, ChangeHandler{
+		Connected: func() { t.Error("a refused stream was never connected") },
+	})
+
+	require.ErrorIs(t, err, ErrBehindHorizon)
+
+	var behind *BehindHorizonError
+	require.ErrorAs(t, err, &behind)
+	assert.Equal(t, int64(512), behind.CompactionHorizon)
+}
+
+func TestChangesStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"not the head", http.StatusUnauthorized, ErrUnauthorized},
+		{"too many calls", http.StatusTooManyRequests, ErrRateLimited},
+		{"unparseable cursor", http.StatusUnprocessableEntity, ErrInvalidRequest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+			})
+
+			require.ErrorIs(t, client.Changes(t.Context(), 0, ChangeHandler{}), tt.want)
+		})
+	}
+}
+
+func TestChangesRefusesANegativeCursorWithoutCalling(t *testing.T) {
+	client := serve(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("a cursor Gentility would 422 was sent anyway")
+	})
+
+	require.ErrorIs(t, client.Changes(t.Context(), -1, ChangeHandler{}), ErrInvalidRequest)
+}
+
+// Cancelling is how the head stops following, and it is not a stream fault.
+func TestChangesReturnsTheContextError(t *testing.T) {
+	release := make(chan struct{})
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(func() { close(release) })
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	err := client.Changes(ctx, 0, ChangeHandler{})
+	require.True(t, errors.Is(err, context.Canceled), "got %v", err)
+}
+
+// A payload that is not a change event is a contract break rather than
+// something to skip: skipping it would advance the head past an event it never
+// applied.
+func TestChangesRefusesAnUndecodableEvent(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "id: 1\ndata: not json\n\n")
+	})
+
+	err := client.Changes(t.Context(), 0, ChangeHandler{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decoding change event")
+}

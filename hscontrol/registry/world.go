@@ -103,6 +103,15 @@ type Change struct {
 // transaction, before the node row is committed (design §4 channel 3).
 // HeadNodeID is the id the head has just allocated, which is why the call
 // belongs after the insert and inside the transaction.
+//
+// # PreauthKeyID is the head's own key id, in decimal
+//
+// Gentility created that pre-auth key through the head's API (§2.3) and stored
+// the id the head answered with, so it looks the enrollment up by that id and
+// by nothing else. It is [types.PreAuthKey.ID] — a uint64 — rendered decimal:
+// B7 passes params.PreAuthKey.ID and not the key's secret, its prefix, or the
+// user it belongs to. A registration carrying anything else is a 404
+// [ErrUnknownKey] however valid the key itself is.
 type Registration struct {
 	PreauthKeyID string `json:"preauth_key_id"`
 	NodeKey      string `json:"node_key"`

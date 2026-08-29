@@ -346,6 +346,27 @@ func PolicyAndPeers(changedPeers ...types.NodeID) Change {
 	}
 }
 
+// VisibilityChange announces that a policy change made some peers visible and
+// others not.
+//
+// # removed must name nodes that are LEAVING, not nodes that are merely hidden
+//
+// [Change.PeersRemoved] is not only a wire field. [mapper.Batcher.addToBatch]
+// reads it as a list of nodes being deleted from the system: it drops each one
+// from the batcher and CLOSES ITS CONTROL SESSION, which is right for
+// [NodeRemoved] and disastrous for a node that is still connected and has only
+// lost sight of a peer. That node would be disconnected for someone else's
+// policy change.
+//
+// The rest of headscale expresses lost visibility differently: a policy update
+// sets RequiresRuntimePeerComputation, the removed set is computed per
+// recipient at build time, and it lands in [tailcfg.MapResponse.PeersRemoved]
+// — a different struct, which nothing treats as a deletion. See
+// https://github.com/juanfont/headscale/issues/2924.
+//
+// So this constructor is safe only where `removed` really is a set of
+// departing nodes. Nothing calls it today; anything that starts to must say
+// which of the two it means.
 func VisibilityChange(reason string, added, removed []types.NodeID) Change {
 	return Change{
 		Reason:        reason,

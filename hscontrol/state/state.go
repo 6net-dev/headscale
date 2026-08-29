@@ -1971,11 +1971,25 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		// error rolls the row back so the head never holds a node
 		// Gentility has not recorded — refusal and outage alike.
 		//
-		// A retry costs no id. The client's next attempt takes the
-		// re-registration branch in [State.HandleNodeFromPreAuthKey],
-		// which finds the node by machine key and allocates nothing;
-		// and Gentility's register is idempotent by content, so a
-		// repeat after a lost response records nothing twice.
+		// A retry after a registration the head KEPT costs no id: the
+		// client's next attempt takes the re-registration branch in
+		// [State.HandleNodeFromPreAuthKey], finds the node by machine
+		// key, allocates nothing and reports nothing.
+		//
+		// A retry after one it did NOT keep — a 200 whose response was
+		// lost, or a commit that failed after this returned — is a
+		// different thing, and the reason register is idempotent by
+		// CONTENT rather than by head node id. The row was rolled
+		// back, so there is no node to find by machine key and the id
+		// is allocated afresh; whether that is the same number is the
+		// database's business, since a rolled-back insert may or may
+		// not return its id to the pool and another machine may take
+		// it in between. Either way the head reports the id it ends up
+		// holding, and Gentility rebinds: the enrollment is registered
+		// and not yet exchanged, and the record it held names an id
+		// nothing will ever poll. Its stale record for an id the head
+		// abandoned is corrected by the registration of whoever ends
+		// up holding it.
 		if err := s.recordRegistration(params, nodeToRegister.ID); err != nil { //nolint:noinlineerr
 			return nil, err
 		}

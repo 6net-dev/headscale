@@ -666,3 +666,114 @@ func TestRegistryRotationIsPublishedOnceRecorded(t *testing.T) {
 
 	assertNodeKey(t, s, node.ID(), newKey.Public())
 }
+
+// TestRegistryRetryAfterALostAcceptanceRebinds is the case the retry note
+// beside [State.recordRegistration] is about, and the one it used to get
+// wrong.
+//
+// Gentility accepts the registration and records it against the head node id
+// the head has just allocated. The head's write then does NOT survive — the
+// response is lost on the wire, or the commit fails after the callback
+// returned — so the row is rolled back and that id never existed on the head.
+//
+// The retry does not resume the first attempt. There is no node to find by
+// machine key, so the head allocates an id afresh and reports THAT, and
+// whether it is the same number is the database's business rather than
+// anything this channel promises: a rolled-back insert may or may not return
+// its id to the pool, and another machine may take it in between. Both are
+// covered here.
+//
+// Neither leaves Gentility wrong, and that is the property worth holding on
+// to: register is by content, the enrollment is registered and not yet
+// exchanged, so whichever node next claims an id rebinds it. Gentility's
+// stale record for an id the head abandoned is corrected by the registration
+// of whoever ends up holding it, and the World it answers is nil in exactly
+// that case (see [registry.RegistrationResult]).
+//
+// A lost response produces the rollback rather than a failed commit:
+// [hsdb.Write] commits after its callback returns and gorm offers no hook on
+// the commit itself, so nothing reachable from a test can fail it. The two are
+// the same fact from the head's side — Gentility recorded a registration the
+// head did not keep — and a lost response is the likelier of them.
+func TestRegistryRetryAfterALostAcceptanceRebinds(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, reusable, _ := registryTestState(t, fake)
+
+	user := s.CreateUserForTest("lost-response-user")
+
+	// One-shot, so the retry also shows the key is still spendable: the
+	// rollback took [hsdb.UsePreAuthKey] with it.
+	oneShot, err := s.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+	require.NoError(t, err)
+
+	first := key.NewMachine()
+	firstReq := registerRequest(oneShot, key.NewNode().Public())
+
+	// A 200 the head cannot read: Gentility has recorded the binding, and
+	// the head has nothing it can commit.
+	fake.answers(http.StatusOK, `{"node_id":`)
+
+	_, _, err = s.HandleNodeFromPreAuthKey(firstReq, first.Public())
+	require.Error(t, err)
+
+	_, isPAK := errors.AsType[types.PAKError](err)
+	assert.False(t, isPAK, "a lost response is transient; the client should retry")
+
+	assertNoNodes(t, s)
+
+	fake.answers(http.StatusOK, `{"node_id":"node-1","world":null}`)
+
+	// A different machine enrolls before the retry, and is free to be given
+	// the very id Gentility was told about — the head abandoned it, so
+	// nothing has a claim on it.
+	other := key.NewMachine()
+
+	otherNode, _, err := s.HandleNodeFromPreAuthKey(
+		registerRequest(reusable, key.NewNode().Public()),
+		other.Public(),
+	)
+	require.NoError(t, err)
+
+	// Now the retry. The one-shot key is still spendable, and the id is
+	// allocated afresh.
+	retried, _, err := s.HandleNodeFromPreAuthKey(firstReq, first.Public())
+	require.NoError(t, err)
+
+	registrations, _ := fake.recorded()
+	require.Len(t, registrations, 3, "the retry is a second registration, not a no-op")
+
+	assert.NotEqual(t, registrations[0].HeadNodeID, registrations[2].HeadNodeID,
+		"the retry does not resume the abandoned id")
+	assert.Equal(t, registry.NodeID(retried.ID().Uint64()), registrations[2].HeadNodeID,
+		"and reports the one it kept")
+	assert.Equal(t, registrations[0].PreauthKeyID, registrations[2].PreauthKeyID,
+		"it is the same enrollment, rebound")
+
+	// The abandoned id went to the other machine, and that machine's own
+	// registration is what corrects Gentility's record of it.
+	assert.Equal(t, registrations[0].HeadNodeID, registrations[1].HeadNodeID)
+	assert.Equal(t, registry.NodeID(otherNode.ID().Uint64()), registrations[1].HeadNodeID)
+	assert.NotEqual(t, registrations[0].MachineKey, registrations[1].MachineKey)
+}
+
+// TestRegistryRetryAfterACommittedRegistrationReportsNothing is the other
+// half of the same note: a retry after a registration the head DID keep finds
+// the node by machine key, allocates nothing, and reports nothing.
+func TestRegistryRetryAfterACommittedRegistrationReportsNothing(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	req := registerRequest(pak, key.NewNode().Public())
+
+	first, _, err := s.HandleNodeFromPreAuthKey(req, machineKey.Public())
+	require.NoError(t, err)
+
+	second, _, err := s.HandleNodeFromPreAuthKey(req, machineKey.Public())
+	require.NoError(t, err)
+
+	assert.Equal(t, first.ID(), second.ID())
+
+	registrations, _ := fake.recorded()
+	assert.Len(t, registrations, 1)
+}

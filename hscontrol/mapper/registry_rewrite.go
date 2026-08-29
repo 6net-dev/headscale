@@ -736,6 +736,12 @@ func searchDomains(names []registry.Name, baseDomain string) []string {
 // [tailcfg.PortRangeAny] anywhere in here: a World that lost a port would then
 // render an open door in place of a closed one, which is the one failure this
 // filter exists to prevent.
+//
+// A path whose endpoints do not parse renders nothing, exactly as
+// [visibleAddresses] makes nothing visible from one. The two read the same
+// field and must read it the same way: an edge that put no address in the
+// visible set but still became a rule is this head guessing at what Gentility
+// meant, on the surface whose whole purpose is that it does not.
 func applyWorldFilters(resp *tailcfg.MapResponse, world *registry.World) {
 	if resp.PacketFilters == nil {
 		return
@@ -744,6 +750,10 @@ func applyWorldFilters(resp *tailcfg.MapResponse, world *registry.World) {
 	rules := make([]tailcfg.FilterRule, 0, len(world.Filters))
 
 	for _, f := range world.Filters {
+		if !readablePath(f) {
+			continue
+		}
+
 		ports := portRanges(f)
 
 		// An empty ports list is a path to NO port, and renders nothing.
@@ -755,6 +765,24 @@ func applyWorldFilters(resp *tailcfg.MapResponse, world *registry.World) {
 	}
 
 	resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": rules}
+}
+
+// readablePath says whether both ends of a path are prefixes this head can
+// parse — the same question [visibleAddresses] asks of the same two fields.
+func readablePath(f registry.Filter) bool {
+	for _, prefix := range []string{f.Src, f.Dst} {
+		if _, err := netip.ParsePrefix(prefix); err != nil { //nolint:noinlineerr
+			log.Warn().
+				Err(err).
+				Str("src", f.Src).
+				Str("dst", f.Dst).
+				Msg("world filter carried an unparsable prefix; rendering no rule for it")
+
+			return false
+		}
+	}
+
+	return true
 }
 
 // portRanges is one single-port range per port the path names, at the path's

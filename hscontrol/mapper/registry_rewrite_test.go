@@ -1023,3 +1023,37 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 
 	return &buf
 }
+
+// A path this head cannot read is a path it cannot enforce.
+//
+// [visibleAddresses] already skips a prefix it cannot parse, so a filter with
+// a malformed endpoint made nothing visible — and yet the rule was rendered
+// anyway, out of the same unparsed string. That is the head guessing at what
+// Gentility meant on the one surface whose whole purpose is that it does not.
+// Both halves now read the World the same way.
+func TestRewriteDropsAPathWithAnUnparsableEndpoint(t *testing.T) {
+	for _, broken := range []registry.Filter{
+		{Src: "not-an-address", Dst: gatewayAddr + "/128", Ports: []int{443}},
+		{Src: selfAddr + "/128", Dst: "not-an-address", Ports: []int{443}},
+
+		// A bare address is not a prefix, and [visibleAddresses] does
+		// not accept one either.
+		{Src: selfAddr, Dst: gatewayAddr + "/128", Ports: []int{443}},
+		{Src: selfAddr + "/128", Dst: gatewayAddr, Ports: []int{443}},
+	} {
+		rules := filterRules(t, broken)
+		assert.Empty(t, rules, "filter %+v", broken)
+	}
+}
+
+// One malformed path does not cost the rest of them: the World is not
+// discarded, only the edge nobody can read.
+func TestRewriteKeepsTheReadablePathsBesideABrokenOne(t *testing.T) {
+	rules := filterRules(t,
+		registry.Filter{Src: "not-an-address", Dst: gatewayAddr + "/128", Ports: []int{443}},
+		registry.Filter{Src: selfAddr + "/128", Dst: gatewayAddr + "/128", Ports: []int{8443}})
+
+	require.Len(t, rules, 1)
+	assert.Equal(t, []string{selfAddr + "/128"}, rules[0].SrcIPs)
+	assert.Equal(t, tailcfg.PortRange{First: 8443, Last: 8443}, rules[0].DstPorts[0].Ports)
+}

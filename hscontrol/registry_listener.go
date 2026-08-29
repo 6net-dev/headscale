@@ -34,6 +34,12 @@ const (
 	// invalidates a cache entry that is already invalid and sends a node an
 	// update it already had.
 	registrySaveInterval = time.Second
+
+	// registryReportInterval throttles the REPORT of a cache that will not
+	// save. The save itself is attempted every time; what is bounded here
+	// is how often a head whose state volume is not writable says so, since
+	// the cause never changes and the file is written once a second.
+	registryReportInterval = time.Minute
 )
 
 // worldCache is the head's cached Worlds as the change-stream runner drives
@@ -117,6 +123,16 @@ type registryRunner struct {
 	// the file was last written.
 	dirty   bool
 	savedAt time.Time
+
+	// failing says whether the last save failed, and reportedAt when that
+	// was last said out loud. Together they make the FIRST failure of a
+	// run an Error and the rest throttled Warns — see [registryRunner.save].
+	failing    bool
+	reportedAt time.Time
+
+	// reportEvery is [registryReportInterval] as a field, so a test can
+	// separate "throttled" from "never happened".
+	reportEvery time.Duration
 }
 
 func newRegistryRunner(
@@ -126,13 +142,14 @@ func newRegistryRunner(
 	path string,
 ) *registryRunner {
 	return &registryRunner{
-		stream:     stream,
-		worlds:     worlds,
-		change:     changeFn,
-		path:       path,
-		backoff:    registryReconnectDelay,
-		backoffMax: registryReconnectMax,
-		saveEvery:  registrySaveInterval,
+		stream:      stream,
+		worlds:      worlds,
+		change:      changeFn,
+		path:        path,
+		backoff:     registryReconnectDelay,
+		backoffMax:  registryReconnectMax,
+		saveEvery:   registrySaveInterval,
+		reportEvery: registryReportInterval,
 	}
 }
 
@@ -289,13 +306,55 @@ func (r *registryRunner) save() {
 		// Not fatal, and not retried here: the next event tries again,
 		// and a head that never manages to write one is a head that
 		// full-refreshes on its next boot.
-		log.Warn().Err(err).Str("path", r.path).Msg("could not persist the registry cache")
+		r.reportSaveFailure(err)
 
 		return
 	}
 
+	r.failing = false
 	r.dirty = false
 	r.savedAt = time.Now()
+}
+
+// reportSaveFailure says a cache write failed, at the level the failure
+// deserves.
+//
+// # Why the first one is an Error
+//
+// Nothing stops. The head serves, follows the stream and refreshes exactly as
+// it did; what it silently loses is fail-static across a restart, coming back
+// with no cursor and no documents and full-refreshing every node before it can
+// serve any of them. On a large installation that is a slow, self-inflicted
+// outage on every deploy, and its only symptom is this line. The usual cause
+// is a bind-mounted state volume still owned by root — see the Dockerfile and
+// docs/registry-mode.md — which is a five-second fix an operator will never
+// make if it is reported at the level everything transient is reported at.
+//
+// # Why the rest are throttled warnings
+//
+// The cause does not change and the file is written once a second, so an
+// unwritable volume would otherwise produce a log line per second forever:
+// an alarm that fires continuously is one nobody reads. A save that then
+// works clears the flag, so a LATER failure is a new fault and is an Error
+// again rather than a continuation of the old one.
+func (r *registryRunner) reportSaveFailure(err error) {
+	if !r.failing {
+		r.failing = true
+		r.reportedAt = time.Now()
+
+		log.Error().Err(err).Str("path", r.path).
+			Msg("could not persist the registry cache; this head will full-refresh on every restart")
+
+		return
+	}
+
+	if time.Since(r.reportedAt) < r.reportEvery {
+		return
+	}
+
+	r.reportedAt = time.Now()
+
+	log.Warn().Err(err).Str("path", r.path).Msg("could not persist the registry cache")
 }
 
 // report says what ended the stream, at the level the ending deserves. A clean

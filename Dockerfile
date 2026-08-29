@@ -40,6 +40,13 @@ USER nonroot:nonroot
 
 # Declared so a deployment that forgets to mount one still gets a writable
 # directory rather than a head that cannot persist its cache.
+#
+# A BIND MOUNT does not inherit this: the host directory arrives with the host's
+# own ownership, and the head runs as uid 65532 with no shell and no way to fix
+# it. `chown 65532:65532` the host directory before mounting it, or the head
+# starts, serves, and silently loses its cache — coming back from every restart
+# with no cursor and no worlds, and full-refreshing every node before it can
+# serve any of them. It says so on the first failed write, at Error.
 VOLUME ["/var/lib/headscale"]
 
 EXPOSE 8080

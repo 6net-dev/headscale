@@ -1,11 +1,14 @@
 package hscontrol
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -410,4 +415,136 @@ func TestRunnerStartsColdOnAnUnreadableCache(t *testing.T) {
 
 	waitFor(t, "the head to subscribe anyway", func() bool { return len(gentility.sinces()) > 0 })
 	assert.Equal(t, "", gentility.sinces()[0], "a cache it could not read leaves it with no cursor")
+}
+
+// # A cache the head cannot write is the fault that looks like nothing
+//
+// Nothing stops: the head serves, follows the stream and refreshes exactly as
+// it did. What it loses is the whole of fail-static across a restart — it
+// comes back with no cursor and no documents, and full-refreshes every node
+// before it can serve any of them. The usual cause is a bind-mounted volume
+// still owned by root, and the only symptom is a log line.
+//
+// So the first one is an Error and the rest are Warns, throttled: an alarm
+// that fires once is one an operator can act on, and an alarm that fires every
+// second is one they filter.
+func TestRunnerReportsTheFirstCacheSaveFailureAtError(t *testing.T) {
+	logs := captureLogs(t)
+
+	cache := newFakeWorldCache()
+	runner := newRegistryRunner(nil, cache, nil, unwritablePath(t))
+	runner.saveEvery = 0
+	runner.reportEvery = 0
+
+	for range 5 {
+		runner.dirty = true
+		runner.save()
+	}
+
+	assert.Equal(t, 1, strings.Count(logs.String(), `"level":"error"`),
+		"the first failure is the news")
+	assert.Equal(t, 4, strings.Count(logs.String(), `"level":"warn"`),
+		"the rest are warnings")
+	assert.Contains(t, logs.String(), "could not persist the registry cache")
+}
+
+// The throttle: the cause of an unwritable volume never changes and the file
+// is written once a second, so a head that says so every second is a head
+// nobody reads.
+func TestRunnerThrottlesRepeatedCacheSaveFailures(t *testing.T) {
+	logs := captureLogs(t)
+
+	cache := newFakeWorldCache()
+	runner := newRegistryRunner(nil, cache, nil, unwritablePath(t))
+	runner.saveEvery = 0
+
+	for range 5 {
+		runner.dirty = true
+		runner.save()
+	}
+
+	assert.Equal(t, 1, strings.Count(logs.String(), `"level":"error"`))
+	assert.Equal(t, 0, strings.Count(logs.String(), `"level":"warn"`),
+		"nothing repeats inside the report interval")
+}
+
+// A save that works after a run of failures is the fault clearing, and the
+// next failure is a new fault rather than a continuation of the old one.
+func TestRunnerReportsAFreshCacheFailureAgain(t *testing.T) {
+	logs := captureLogs(t)
+
+	dir := t.TempDir()
+
+	cache := newFakeWorldCache()
+	runner := newRegistryRunner(nil, cache, nil, filepath.Join(dir, "cache.json"))
+	runner.saveEvery = 0
+	runner.reportEvery = time.Hour
+
+	runner.path = unwritablePath(t)
+	runner.dirty = true
+	runner.save()
+
+	runner.path = filepath.Join(dir, "cache.json")
+	runner.dirty = true
+	runner.save()
+
+	runner.path = unwritablePath(t)
+	runner.dirty = true
+	runner.save()
+
+	assert.Equal(t, 2, strings.Count(logs.String(), `"level":"error"`),
+		"a failure after a working save is a new fault, not a continuation")
+}
+
+// A cache that saves says nothing at all.
+func TestRunnerIsSilentWhenTheCacheSaves(t *testing.T) {
+	logs := captureLogs(t)
+
+	cache := newFakeWorldCache()
+	runner := newRegistryRunner(nil, cache, nil, filepath.Join(t.TempDir(), "cache.json"))
+	runner.saveEvery = 0
+
+	runner.dirty = true
+	runner.save()
+
+	assert.NotContains(t, logs.String(), `"level":"error"`)
+	assert.NotContains(t, logs.String(), `"level":"warn"`)
+}
+
+// unwritablePath names a cache file under a path that is a regular file, so
+// the directory the save has to make cannot be made. It stands in for the
+// real fault — a volume the head's uid does not own — without needing one.
+func unwritablePath(t *testing.T) string {
+	t.Helper()
+
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
+
+	return filepath.Join(blocker, "cache.json")
+}
+
+// captureLogs points the global zerolog logger at a buffer for one test. The
+// runner reports through the package-level logger, which is where an operator
+// reads this and where a test has to.
+//
+// The global LEVEL is lowered with it: something in this package's test set
+// raises it, and a Warn the filter swallowed reads exactly like a Warn that
+// was never made.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	previous := log.Logger
+	previousLevel := zerolog.GlobalLevel()
+
+	log.Logger = zerolog.New(&buf)
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+
+	t.Cleanup(func() {
+		log.Logger = previous
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+
+	return &buf
 }

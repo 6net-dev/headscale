@@ -992,16 +992,24 @@ func TestRewriteIsSilentWhenTheBaseDomainsAgree(t *testing.T) {
 
 // captureLogs points the global zerolog logger at a buffer for one test. The
 // rewrite reports through the package-level logger, which is the only place
-// its warnings and this Error can be read from.
+// its warnings and this Error can be read from. The global level is lowered
+// with it, since a line the filter swallowed reads exactly like a line that
+// was never written.
 func captureLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
 
 	var buf bytes.Buffer
 
 	previous := log.Logger
-	log.Logger = zerolog.New(&buf)
+	previousLevel := zerolog.GlobalLevel()
 
-	t.Cleanup(func() { log.Logger = previous })
+	log.Logger = zerolog.New(&buf)
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+
+	t.Cleanup(func() {
+		log.Logger = previous
+		zerolog.SetGlobalLevel(previousLevel)
+	})
 
 	return &buf
 }

@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,24 @@ import (
 // Gentility that accepts a connection and then says nothing must not hold a
 // database transaction open for as long as the kernel will keep the socket.
 const requestTimeout = 5 * time.Second
+
+// The change stream is bounded by evidence rather than by a deadline, in two
+// places, because a connection that is open is not a stream that is working
+// and nothing in TCP distinguishes the two.
+const (
+	// responseHeaderTimeout bounds the wait for Gentility's status line.
+	// There is no stream to watch yet, so the transport is what holds this
+	// one: a peer that accepts the connection and then says nothing would
+	// otherwise be waited on for as long as the kernel keeps the socket.
+	responseHeaderTimeout = 10 * time.Second
+
+	// defaultIdleTimeout is how long an OPEN stream may go without a line
+	// before it is torn down for the reconnect to replace. Gentility
+	// heartbeats, so silence is not a quiet network — it is a stream that
+	// has stopped, and a head that keeps waiting on one is a head that has
+	// stopped hearing about changes without knowing it.
+	defaultIdleTimeout = 60 * time.Second
+)
 
 // Errors, one per cell of §2.3's status table that a caller can act on.
 var (
@@ -79,6 +98,12 @@ var (
 	// rather than a user error.
 	ErrInvalidRequest = errors.New("registry: invalid request")
 
+	// ErrStreamIdle: no line arrived on an open change stream inside the
+	// idle window. Not a refusal — Gentility never answered anything — so
+	// the head reconnects with the cursor it has, exactly as it would after
+	// any other drop.
+	ErrStreamIdle = errors.New("registry: change stream went idle")
+
 	// ErrBehindHorizon: 410 on changes. Match with errors.Is; recover the
 	// horizon itself with errors.As on [BehindHorizonError].
 	ErrBehindHorizon = errors.New("registry: cursor behind the compaction horizon")
@@ -114,17 +139,47 @@ type Client struct {
 	// how much traffic was flowing through it.
 	http   *http.Client
 	stream *http.Client
+
+	// idleTimeout is how long the open stream may go without a line. See
+	// [defaultIdleTimeout].
+	idleTimeout time.Duration
+}
+
+// Option configures a [Client] at construction. Everything the contract fixes
+// is a constant; an Option is for what a deployment may legitimately differ
+// on.
+type Option func(*Client)
+
+// WithIdleTimeout sets how long an open change stream may go without a line
+// before [Client.Changes] tears it down with [ErrStreamIdle]. It must be
+// comfortably longer than Gentility's heartbeat interval, or a healthy stream
+// is cut every heartbeat gap.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(c *Client) { c.idleTimeout = d }
 }
 
 // New returns a client for the Gentility at baseURL, authenticating every
 // call — in both directions — with bearer.
-func New(baseURL, bearer string) *Client {
-	return &Client{
-		baseURL: strings.TrimSuffix(baseURL, "/"),
-		bearer:  bearer,
-		http:    &http.Client{Timeout: requestTimeout},
-		stream:  &http.Client{},
+func New(baseURL, bearer string, opts ...Option) *Client {
+	// Cloned rather than built, so the stream keeps the proxy, dialer and
+	// pool settings the default transport carries and differs only where
+	// this channel needs it to.
+	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert // the stdlib's own type
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+
+	client := &Client{
+		baseURL:     strings.TrimSuffix(baseURL, "/"),
+		bearer:      bearer,
+		http:        &http.Client{Timeout: requestTimeout},
+		stream:      &http.Client{Transport: transport},
+		idleTimeout: defaultIdleTimeout,
 	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client
 }
 
 // World fetches the current World for one head node id.
@@ -270,7 +325,13 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 		path += "?since=" + strconv.FormatInt(*since, 10)
 	}
 
-	req, err := c.request(ctx, http.MethodGet, path, nil)
+	// The stream's own context, so the idle watchdog has something to
+	// cancel: the read below is blocked in the kernel, and closing the body
+	// under it is the only thing that wakes it.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := c.request(streamCtx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -298,26 +359,55 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 		return c.common(resp, "changes")
 	}
 
+	// Before the watchdog, not after: Connected full-refreshes every cached
+	// World, and no line can arrive while it runs, so a slow refresh would
+	// otherwise trip a stream that has done nothing wrong.
 	if h.Connected != nil {
 		h.Connected()
 	}
 
-	return readChanges(ctx, resp.Body, h.Changed)
+	var idle atomic.Bool
+
+	watchdog := time.AfterFunc(c.idleTimeout, func() {
+		idle.Store(true)
+		cancel()
+	})
+	defer watchdog.Stop()
+
+	err = readChanges(streamCtx, resp.Body, h.Changed, func() {
+		watchdog.Reset(c.idleTimeout)
+	})
+
+	// The cancellation the watchdog caused surfaces as a context error;
+	// name what really happened, since the two call for the same reconnect
+	// but read very differently in a log.
+	if err != nil && idle.Load() {
+		return fmt.Errorf("%w after %s", ErrStreamIdle, c.idleTimeout)
+	}
+
+	return err
 }
 
-// readChanges decodes the Server-Sent Events framing Gentility writes: an
+// readChanges decodes the Server-Sent Events framing Gentility writes, calling
+// alive for every line it reads: an
 // event is "id: <seq>", "data: <json>", blank line; a heartbeat is the comment
 // ": keepalive". Comments and unknown fields are ignored, per the SSE rules,
 // and so is "id" — the cursor the head persists is the seq inside the payload,
 // and an id line that disagreed with it would be a second answer to what the
 // cursor is.
-func readChanges(ctx context.Context, body io.Reader, changed func(Change)) error {
+func readChanges(ctx context.Context, body io.Reader, changed func(Change), alive func()) error {
 	reader := newLineReader(body)
 
 	var data []string
 
 	for {
 		line, err := reader.line()
+		if err == nil {
+			// Any line at all, heartbeat included: the stream is
+			// alive, which is the whole of what the watchdog asks.
+			alive()
+		}
+
 		if err != nil {
 			// A cancelled context surfaces here as a read error on a body
 			// that was closed under us. Report the cancellation, which is

@@ -38,13 +38,13 @@ const worldV1 = `{
 func cursor(seq int64) *int64 { return &seq }
 
 // serve starts a test Gentility and returns a client pointed at it.
-func serve(t *testing.T, handler http.HandlerFunc) *Client {
+func serve(t *testing.T, handler http.HandlerFunc, opts ...Option) *Client {
 	t.Helper()
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	return New(server.URL, testBearer)
+	return New(server.URL, testBearer, opts...)
 }
 
 func TestWorldDecodesTheV1Document(t *testing.T) {
@@ -472,4 +472,67 @@ func TestChangesRecoversFromTheHorizonWithoutACursor(t *testing.T) {
 
 	assert.Equal(t, []string{"since=7", ""}, queries,
 		"recovery asks for the tail; since=0 would earn the same 410 forever")
+}
+
+// A connection that is open is not a stream that is working. Nothing in TCP
+// tells the head that Gentility stopped writing, so the stream is judged by
+// the only evidence it has — bytes arriving — and a silent one is torn down
+// for the reconnect to replace.
+func TestChangesGivesUpOnAStreamThatFallsSilent(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "id: 1\ndata: {\"seq\":1,\"head_node_id\":\"3\",\"world_revision\":1}\n\n")
+		w.(http.Flusher).Flush()
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}, WithIdleTimeout(50*time.Millisecond))
+
+	var got []Change
+
+	err := client.Changes(t.Context(), nil, ChangeHandler{
+		Changed: func(c Change) { got = append(got, c) },
+	})
+
+	require.ErrorIs(t, err, ErrStreamIdle)
+	assert.Len(t, got, 1, "the events that did arrive were still delivered")
+}
+
+// A stream whose only traffic is heartbeats is a stream that is working, and
+// every line it sends buys it another window.
+func TestChangesKeepsAStreamThatKeepsTalking(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		for range 6 {
+			io.WriteString(w, ": keepalive\n\n")
+			w.(http.Flusher).Flush()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}, WithIdleTimeout(60*time.Millisecond))
+
+	require.NoError(t, client.Changes(t.Context(), nil, ChangeHandler{}),
+		"120ms of heartbeats through a 60ms window is a live stream")
+}
+
+// A Gentility that accepts the connection and never answers is the same
+// silence one layer earlier, and the transport is what bounds it — there is no
+// stream to watch yet.
+func TestNewBoundsTheWaitForResponseHeaders(t *testing.T) {
+	client := New("https://example.invalid", testBearer)
+
+	transport, ok := client.stream.Transport.(*http.Transport)
+	require.True(t, ok, "the stream client carries a transport of its own")
+	assert.Equal(t, responseHeaderTimeout, transport.ResponseHeaderTimeout)
+	assert.Zero(t, client.stream.Timeout,
+		"a Timeout covers the body too, and would cut a healthy stream at its deadline")
+}
+
+// The default is a property of the contract rather than of a caller.
+func TestNewDefaultsTheIdleTimeout(t *testing.T) {
+	assert.Equal(t, defaultIdleTimeout, New("https://example.invalid", testBearer).idleTimeout)
+	assert.Equal(t, time.Minute,
+		New("https://example.invalid", testBearer, WithIdleTimeout(time.Minute)).idleTimeout)
 }

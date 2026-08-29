@@ -63,11 +63,22 @@ trusted_proxies: []
 # holding it, or — for a development machine only — as `bearer` inline.
 # `bearer` and `bearer_path` are mutually exclusive.
 #
+# `cache_path` is where the head persists the worlds it has fetched and how
+# far it has followed the change stream. Put it on a volume that survives a
+# restart: the file is what lets a head that comes back to an unreachable
+# registry serve the netmaps it last rendered instead of serving nothing.
+# It defaults to /var/lib/headscale/registry-cache.json.
+#
+# `dns.base_domain` below MUST equal the registry's OVERLAY_BASE_DOMAIN — it
+# is the domain the rendered world's names are composed under, and a head
+# that disagrees composes hostnames no peer answers to.
+#
 # Leave this unset to run as upstream headscale does.
 #
 # registry:
 #   url: http://127.0.0.1:4000
 #   bearer_path: /run/secrets/registry-bearer
+#   cache_path: /var/lib/headscale/registry-cache.json
 
 # The Noise section includes specific configuration for the
 # TS2021 Noise protocol
@@ -350,6 +361,10 @@ dns:
   # `base_domain` must be a FQDN, without the trailing dot.
   # The FQDN of the hosts will be
   # `hostname.base_domain` (e.g., _myhost.example.com_).
+  #
+  # In registry mode this MUST equal the registry's OVERLAY_BASE_DOMAIN: the
+  # registry composes the world's names under its own base domain, and a head
+  # that disagrees serves names nothing resolves.
   base_domain: example.com
 
   # Whether to use the local DNS settings of a node or override the local DNS

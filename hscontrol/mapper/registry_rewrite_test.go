@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"sync"
@@ -728,4 +729,62 @@ func TestRewriteCountsNothingWhenItSeals(t *testing.T) {
 	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
 
 	assert.InDelta(t, before, testutil.ToFloat64(registryRewriteWithheld), 0.0)
+}
+
+// The DERP map is configuration, and Gentility renders it from the same config
+// that renders everything else. A head that kept its own would send nodes to
+// relays the overlay does not run.
+func TestRewriteAppliesTheWorldDERPMap(t *testing.T) {
+	self := world("1", "acme", "n1", []string{selfAddr})
+	self.DERPMap = json.RawMessage(
+		`{"Regions":{"1":{"RegionID":1,"RegionCode":"overlay","Nodes":[` +
+			`{"Name":"1a","RegionID":1,"HostName":"derp.overlay.example","DERPPort":443}]}}}`)
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self})
+
+	resp := &tailcfg.MapResponse{
+		Node:    worldNode(1, "100.64.0.1"),
+		DERPMap: &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{9: {RegionCode: "stale"}}},
+	}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.NotNil(t, resp.DERPMap)
+	require.Len(t, resp.DERPMap.Regions, 1)
+
+	region := resp.DERPMap.Regions[1]
+	require.NotNil(t, region, "the head's own regions are replaced, not merged")
+	assert.Equal(t, "overlay", region.RegionCode)
+	require.Len(t, region.Nodes, 1)
+	assert.Equal(t, "derp.overlay.example", region.Nodes[0].HostName)
+}
+
+// A World that carries no derp_map is not an instruction to have no relays.
+func TestRewriteLeavesTheDERPMapAloneWhenTheWorldSendsNone(t *testing.T) {
+	store := newFakeWorlds(map[string]*registry.World{
+		"1": world("1", "acme", "n1", []string{selfAddr}),
+	})
+
+	own := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{9: {RegionCode: "embedded"}}}
+
+	resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1"), DERPMap: own}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.Same(t, own, resp.DERPMap)
+}
+
+// An explicit null is the same absence, and a document this head cannot parse
+// is not a reason to strand every node with no relay at all.
+func TestRewriteKeepsTheDERPMapOnAnUnreadableOne(t *testing.T) {
+	for _, raw := range []string{`null`, `"not a derp map"`} {
+		self := world("1", "acme", "n1", []string{selfAddr})
+		self.DERPMap = json.RawMessage(raw)
+
+		store := newFakeWorlds(map[string]*registry.World{"1": self})
+		own := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{9: {RegionCode: "embedded"}}}
+
+		resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1"), DERPMap: own}
+		require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+		assert.Same(t, own, resp.DERPMap, "derp_map %s", raw)
+	}
 }

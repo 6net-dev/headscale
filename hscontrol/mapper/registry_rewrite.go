@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -153,6 +154,7 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 
 	applyWorldDNS(resp, world, m.baseDomain())
 	applyWorldFilters(resp, world)
+	applyWorldDERPMap(resp, world)
 
 	return nil
 }
@@ -474,6 +476,35 @@ func portRanges(f registry.Filter) []tailcfg.NetPortRange {
 	}
 
 	return ranges
+}
+
+// applyWorldDERPMap installs the relays Gentility renders from config
+// (master §2.4: derp_map is configuration, passed through verbatim). A head
+// left holding its own would send nodes to relays the overlay does not run.
+//
+// A World that carries no derp_map is not an instruction to have no relays,
+// and neither is one this head cannot parse: both leave the head's own map
+// standing, because a node with a stale relay list can still reach a relay and
+// a node with none cannot reach anything.
+func applyWorldDERPMap(resp *tailcfg.MapResponse, world *registry.World) {
+	if len(world.DERPMap) == 0 {
+		return
+	}
+
+	var derpMap tailcfg.DERPMap
+	if err := json.Unmarshal(world.DERPMap, &derpMap); err != nil {
+		log.Warn().Err(err).Msg("world carried an unreadable derp map; keeping the head's own")
+
+		return
+	}
+
+	// "null" parses without error into the zero value; it is an absent map
+	// rather than an empty one.
+	if derpMap.Regions == nil && derpMap.HomeParams == nil {
+		return
+	}
+
+	resp.DERPMap = &derpMap
 }
 
 // applyWorldName names a node inside one organization: index 0 for a node

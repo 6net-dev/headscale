@@ -32,6 +32,12 @@ type fakeRegistry struct {
 	body         string
 	rotateStatus int
 
+	// duringRotate runs on the server goroutine while the head is blocked
+	// in /rotate — that is, inside its open write transaction and before
+	// the commit. It is the only vantage point from which what the head
+	// has already published can be seen.
+	duringRotate func()
+
 	mu            sync.Mutex
 	registrations []registry.Registration
 	rotations     []registry.Rotation
@@ -69,7 +75,12 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 		f.mu.Lock()
 		f.rotations = append(f.rotations, rot)
 		status := f.rotateStatus
+		observe := f.duringRotate
 		f.mu.Unlock()
+
+		if observe != nil {
+			observe()
+		}
 
 		w.WriteHeader(status)
 	})
@@ -587,4 +598,71 @@ func authPathRequest(
 	}))
 
 	return authID
+}
+
+// TestRegistryRotationIsNotPublishedBeforeItIsRecorded is the ordering the
+// create path has always had, on the path that did not: the database
+// transaction — with the channel 4 callback inside it — commits BEFORE the
+// NodeStore is told anything.
+//
+// The NodeStore is what a long poll is answered from, so a NodeStore updated
+// first is a window in which a concurrent poll is served under a key Gentility
+// has never been told about. It is short and it is real, and a rotation that
+// is then refused leaves the head having published a key that never existed.
+//
+// The assertion runs on the registry's own goroutine while the head is blocked
+// in /rotate, which is the only place the intermediate state is visible at all.
+func TestRegistryRotationIsNotPublishedBeforeItIsRecorded(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	oldKey := key.NewNode()
+	newKey := key.NewNode()
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	var published key.NodePublic
+
+	fake.duringRotate = func() {
+		cached, ok := s.GetNodeByID(node.ID())
+		require.True(t, ok)
+
+		published = cached.NodeKey()
+	}
+
+	fake.refusesRotation(http.StatusConflict)
+
+	_, _, err = s.HandleNodeFromPreAuthKey(registerRequest(pak, newKey.Public()), machineKey.Public())
+	require.Error(t, err)
+
+	assert.Equal(t, oldKey.Public(), published,
+		"the NodeStore must still hold the old key while the rotation is being recorded")
+
+	// And the refusal leaves the head exactly as it was, row and snapshot.
+	assertNodeKey(t, s, node.ID(), oldKey.Public())
+}
+
+// TestRegistryRotationIsPublishedOnceRecorded is the other half: the commit
+// happening first must not mean the NodeStore is left behind.
+func TestRegistryRotationIsPublishedOnceRecorded(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	oldKey := key.NewNode()
+	newKey := key.NewNode()
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	rotated, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, newKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+	require.Equal(t, node.ID(), rotated.ID())
+
+	assert.Equal(t, newKey.Public(), rotated.NodeKey(),
+		"the view the caller is handed is the rotated one")
+
+	assertNodeKey(t, s, node.ID(), newKey.Public())
 }

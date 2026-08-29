@@ -2548,18 +2548,22 @@ func (s *State) HandleNodeFromPreAuthKey(
 			return types.NodeView{}, change.Change{}, ErrNodeKeyInUse
 		}
 
-		// Snapshot the pre-update node so the NodeStore can be rolled back if
-		// the database write below fails. The view points at the immutable
-		// pre-update snapshot (UpdateNode swaps in a new one), so this stays
-		// valid after the mutation.
-		priorNode := existingNodeSameUser.AsStruct()
-
 		// The key being replaced, read before anything replaces it. It is
 		// half of what a rotation is, and the write below reports it.
 		priorNodeKey := existingNodeSameUser.NodeKey()
 
-		// Update existing node - NodeStore first, then database
-		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeSameUser.ID(), func(node *types.Node) {
+		// One clock reading for the whole re-registration. The mutation
+		// below is applied twice — once to compute what the row will hold,
+		// once through [NodeStore.UpdateNode] to publish it — so anything
+		// it reads must be the same both times or the row and the snapshot
+		// would disagree by however long the database write took.
+		reregisteredAt := time.Now()
+		defaultExpiry := reregisteredAt.Add(s.cfg.Node.Expiry)
+
+		// The re-registration, as a function of the node it is applied to.
+		// It is deterministic given that node, which is what makes applying
+		// it to a copy a faithful preview of applying it to the store.
+		rereg := func(node *types.Node) {
 			node.NodeKey = regReq.NodeKey
 			node.Hostname = hostname
 
@@ -2610,7 +2614,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			// [State.Connect]/[State.Disconnect] in the poll session lifecycle.
 			// Resetting it during re-registration causes a false offline blip
 			// to peers.
-			node.LastSeen = new(time.Now())
+			node.LastSeen = new(reregisteredAt)
 
 			// Tagged nodes keep their existing expiry (disabled).
 			// User-owned nodes update expiry from the client request,
@@ -2622,8 +2626,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 				if !regReq.Expiry.IsZero() {
 					node.Expiry = &regReq.Expiry
 				} else if s.cfg.Node.Expiry > 0 {
-					exp := time.Now().Add(s.cfg.Node.Expiry)
-					node.Expiry = &exp
+					node.Expiry = new(defaultExpiry)
 				} else {
 					node.Expiry = nil
 				}
@@ -2635,11 +2638,25 @@ func (s *State) HandleNodeFromPreAuthKey(
 				// is left untouched.
 				node.Expiry = nil
 			}
-		})
-
-		if !ok {
-			return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, existingNodeSameUser.ID())
 		}
+
+		// # The database commits first, and the NodeStore is told afterwards
+		//
+		// The NodeStore is what a long poll is answered from, so an update
+		// applied to it before the write commits is a window in which a
+		// concurrent poll is served under a key nothing has recorded — and,
+		// if the rotation is then refused, under a key that never existed.
+		// [State.createAndSaveNewNode] has always committed first; this path
+		// used to lead with the NodeStore and unwind it on failure, which is
+		// a rollback that cannot cover the reads taken during the window.
+		//
+		// So the mutation is previewed on a copy, persisted, and only then
+		// published. It is applied to the store through
+		// [NodeStore.UpdateNode] rather than put back wholesale, so a field
+		// this registration does not touch — IsOnline, endpoints — keeps
+		// whatever a concurrent writer gave it.
+		pendingNode := existingNodeSameUser.AsStruct()
+		rereg(pendingNode)
 
 		_, err = hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
 			// Explicitly select all node columns so GORM includes nil/zero-value fields
@@ -2650,7 +2667,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			// key and any key-scoped property (e.g. Ephemeral) silently reverts.
 			reregColumns := append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
 
-			err := tx.Select(reregColumns).Updates(updatedNodeView.AsStruct()).Error
+			err := tx.Select(reregColumns).Updates(pendingNode).Error
 			if err != nil {
 				return nil, fmt.Errorf("saving node: %w", err)
 			}
@@ -2672,8 +2689,9 @@ func (s *State) HandleNodeFromPreAuthKey(
 			// (design §4 channel 4): it closes the previous key's
 			// interval and opens the next, and a head that committed
 			// first would hold a key Gentility could not attribute.
-			// Returning an error here rolls the row back, and the
-			// priorNode restore below rolls the NodeStore back with it.
+			// Returning an error here rolls the row back — and the
+			// NodeStore has not been told anything yet, so there is
+			// nothing to unwind.
 			if isNodeKeyRotation {
 				if err := s.recordRotation(existingNodeSameUser.ID(), priorNodeKey, regReq.NodeKey); err != nil { //nolint:noinlineerr
 					return nil, err
@@ -2683,14 +2701,13 @@ func (s *State) HandleNodeFromPreAuthKey(
 			return nil, nil //nolint:nilnil // intentional: transaction success
 		})
 		if err != nil {
-			// The NodeStore was updated before the database write. Roll it back
-			// so it does not advertise a registration the database rejected
-			// (e.g. a node key that a restart would not reload).
-			if priorNode != nil {
-				s.nodeStore.PutNode(*priorNode)
-			}
-
 			return types.NodeView{}, change.Change{}, fmt.Errorf("writing node to database: %w", err)
+		}
+
+		// Committed, and Gentility has recorded it. Now the head may say so.
+		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeSameUser.ID(), rereg)
+		if !ok {
+			return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, existingNodeSameUser.ID())
 		}
 
 		log.Trace().

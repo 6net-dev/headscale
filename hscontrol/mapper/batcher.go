@@ -687,11 +687,27 @@ func (b *Batcher) addToBatch(changes ...change.Change) {
 	// See: https://github.com/juanfont/headscale/issues/2924
 	for _, ch := range changes {
 		for _, removedID := range ch.PeersRemoved {
-			if _, existed := b.nodes.LoadAndDelete(removedID); existed {
+			if nc, existed := b.nodes.LoadAndDelete(removedID); existed {
 				b.totalNodes.Add(-1)
+
+				// The node is gone, so its control session goes with
+				// it. Forgetting the entry alone leaves the long poll
+				// open and the device holding the netmap it was last
+				// sent — for a revoked node that is access outliving
+				// the revocation (design §4 channel 2, §9 step 2).
+				//
+				// Racing cleanup paths are already safe:
+				// [multiChannelNodeConn.close] is sync.Once-guarded and
+				// [multiChannelNodeConn.stopConnection] is
+				// compare-and-swap guarded, so no session is torn down
+				// twice and none needs a further guard here.
+				if nc != nil {
+					nc.close()
+				}
+
 				log.Debug().
 					Uint64(zf.NodeID, removedID.Uint64()).
-					Msg("removed deleted node from batcher")
+					Msg("removed deleted node from batcher and closed its session")
 			}
 		}
 	}

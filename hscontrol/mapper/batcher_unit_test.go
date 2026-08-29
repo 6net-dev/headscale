@@ -1184,3 +1184,74 @@ func TestRemoveConnectionAtIndex_NilsTrailingSlot(t *testing.T) {
 
 	mc.mutex.Unlock()
 }
+
+// ============================================================================
+// addToBatch: deleting a node closes its control session
+// ============================================================================
+
+// TestAddToBatch_ClosesDeletedNodesSession is design §4 channel 2 and §9's
+// revocation step 2: deleting a node must tear the node's long poll down, not
+// merely forget it here. Upstream drops the batcher entry and leaves the
+// session open, so a revoked device keeps its stream — and its netmap — until
+// it happens to reconnect.
+//
+// [connectionEntry.stop] is what poll.go hands in ([Batcher.AddNode]); calling
+// it is what ends the long poll.
+func TestAddToBatch_ClosesDeletedNodesSession(t *testing.T) {
+	b := NewBatcher(time.Second, 1, nil)
+
+	var stops atomic.Int64
+
+	nc := newMultiChannelNodeConn(7, nil)
+	nc.connections = []*connectionEntry{{
+		id:      "poll-1",
+		c:       make(chan *tailcfg.MapResponse, 1),
+		version: tailcfg.CapabilityVersion(100),
+		created: time.Now(),
+		stop:    func() { stops.Add(1) },
+	}}
+
+	b.nodes.Store(7, nc)
+	b.totalNodes.Add(1)
+
+	b.addToBatch(change.NodeRemoved(7))
+
+	_, still := b.nodes.Load(7)
+	assert.False(t, still, "a deleted node must leave the batcher")
+	assert.Equal(t, int64(1), stops.Load(), "the deleted node's control session must be closed")
+	assert.Equal(t, int64(0), b.totalNodes.Load())
+}
+
+// TestAddToBatch_ClosesEveryConnectionOnce: a node may hold more than one poll
+// (a reconnect racing its predecessor), and every one of them has to go. The
+// close is [sync.Once]-guarded and each connection is compare-and-swap
+// guarded, so a cleanup path racing this one cannot stop a session twice.
+func TestAddToBatch_ClosesEveryConnectionOnce(t *testing.T) {
+	b := NewBatcher(time.Second, 1, nil)
+
+	var stops atomic.Int64
+
+	nc := newMultiChannelNodeConn(9, nil)
+	for _, id := range []string{"poll-1", "poll-2"} {
+		nc.connections = append(nc.connections, &connectionEntry{
+			id:      id,
+			c:       make(chan *tailcfg.MapResponse, 1),
+			version: tailcfg.CapabilityVersion(100),
+			created: time.Now(),
+			stop:    func() { stops.Add(1) },
+		})
+	}
+
+	b.nodes.Store(9, nc)
+	b.totalNodes.Add(1)
+
+	b.addToBatch(change.NodeRemoved(9))
+	require.Equal(t, int64(2), stops.Load(), "every connection the node held must be stopped")
+
+	// A second removal of the same node, and a cleanup path calling
+	// close directly, are both no-ops rather than a second teardown.
+	b.addToBatch(change.NodeRemoved(9))
+	nc.close()
+
+	assert.Equal(t, int64(2), stops.Load(), "each connection is stopped exactly once")
+}

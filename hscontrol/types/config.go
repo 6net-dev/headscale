@@ -34,6 +34,7 @@ const (
 var (
 	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
 	errRegistryBearerExclusive   = errors.New("registry.bearer and registry.bearer_path are mutually exclusive")
+	errRegistryBearerRequired    = errors.New("registry.url is set but no registry bearer was supplied")
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
@@ -1113,7 +1114,9 @@ func LoadCLIConfig() (*Config, error) {
 // resolveRegistryBearer reads the shared secret the head authenticates to the
 // registry with, in the order a deployment can supply it: the REGISTRY_BEARER
 // environment variable, then a file named by registry.bearer_path, then the
-// literal registry.bearer.
+// literal registry.bearer. The exclusivity of the two config keys is checked
+// first, before the environment is read, so a config file that asks two
+// questions is refused however the answer is eventually supplied.
 //
 // The environment variable wins because it is what an orchestrator injects
 // over whatever the baked-in config file says. The file exists because a
@@ -1121,19 +1124,23 @@ func LoadCLIConfig() (*Config, error) {
 // mutually exclusive for the same reason oidc_client_secret and its path are —
 // two answers to one question is a deployment nobody can read.
 func resolveRegistryBearer() (string, error) {
-	if bearer := os.Getenv("REGISTRY_BEARER"); bearer != "" {
-		return bearer, nil
+	bearer := viper.GetString("registry.bearer")
+	path := viper.GetString("registry.bearer_path")
+
+	// Before the environment, not after. The environment decides which
+	// ANSWER is used; whether the config file asks two questions is a
+	// separate fault, and one an operator would otherwise meet for the
+	// first time on the deploy that stopped injecting the variable.
+	if bearer != "" && path != "" {
+		return "", errRegistryBearerExclusive
 	}
 
-	bearer := viper.GetString("registry.bearer")
+	if fromEnv := os.Getenv("REGISTRY_BEARER"); fromEnv != "" {
+		return fromEnv, nil
+	}
 
-	path := viper.GetString("registry.bearer_path")
 	if path == "" {
 		return bearer, nil
-	}
-
-	if bearer != "" {
-		return "", errRegistryBearerExclusive
 	}
 
 	secret, err := os.ReadFile(os.ExpandEnv(path))
@@ -1142,6 +1149,32 @@ func resolveRegistryBearer() (string, error) {
 	}
 
 	return strings.TrimSpace(string(secret)), nil
+}
+
+// resolveRegistry is the registry channel's two settings together, because
+// neither is usable alone.
+//
+// A registry named without a bearer refuses to boot. The bearer is the whole
+// of the head's authority here (§2.3 authenticates both directions with it),
+// so such a head would call Gentility, be answered 401, and fail every map
+// build closed — a control plane that starts and then serves nothing, which is
+// far harder to diagnose than one that does not start.
+//
+// A bearer with no url is inert rather than wrong: nothing reads it, and
+// refusing would break a deployment that stages the secret ahead of the
+// cutover.
+func resolveRegistry() (string, string, error) {
+	bearer, err := resolveRegistryBearer()
+	if err != nil {
+		return "", "", err
+	}
+
+	url := viper.GetString("registry.url")
+	if url != "" && bearer == "" {
+		return "", "", errRegistryBearerRequired
+	}
+
+	return url, bearer, nil
 }
 
 // LoadServerConfig returns the full Headscale configuration to
@@ -1237,7 +1270,7 @@ func LoadServerConfig() (*Config, error) {
 		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
-	registryBearer, err := resolveRegistryBearer()
+	registryURL, registryBearer, err := resolveRegistry()
 	if err != nil {
 		return nil, err
 	}
@@ -1269,7 +1302,7 @@ func LoadServerConfig() (*Config, error) {
 
 		PrefixV4:       prefix4,
 		PrefixV6:       prefix6,
-		RegistryURL:    viper.GetString("registry.url"),
+		RegistryURL:    registryURL,
 		RegistryBearer: registryBearer,
 		IPAllocation:   alloc,
 

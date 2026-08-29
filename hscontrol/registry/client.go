@@ -336,12 +336,18 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 		return err
 	}
 
-	// application/json is not decoration. Gentility puts the change stream
-	// behind the same `plug :accepts, ["json"]` as the other three calls, and
-	// Phoenix answers an Accept header naming only text/event-stream with a
-	// 406 before the controller is ever reached. Naming both is honest —
-	// the stream is what we want, JSON is what its frames and its refusals
-	// are made of — and it is what gets through that pipeline.
+	// Both types are named because this call really does accept both. The
+	// stream is what a 200 is made of; every refusal on it is JSON, and one
+	// of them carries a value the head acts on — the 410's
+	// compaction_horizon. An Accept naming only text/event-stream would be
+	// claiming not to accept the answer we parse in [behindHorizon].
+	//
+	// It is not a workaround for a 406. Gentility puts this endpoint behind
+	// `plug :accepts, ["json"]`, and whether text/event-stream negotiates
+	// through that depends on the MIME types compiled into that
+	// application — a build-time fact of another repository, which is
+	// exactly the sort of thing this header should not be silently relying
+	// on either way.
 	req.Header.Set("Accept", "text/event-stream, application/json")
 	req.Header.Set("Cache-Control", "no-cache")
 

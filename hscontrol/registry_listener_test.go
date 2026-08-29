@@ -202,9 +202,12 @@ func testRunner(
 	return runner, changes
 }
 
-// run starts the runner and stops it when the test ends.
+// run restores and then starts the runner, in that order and on that
+// goroutine, which is what app.go does and what the ordering is for.
 func run(t *testing.T, runner *registryRunner) {
 	t.Helper()
+
+	runner.restore()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -547,4 +550,41 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 	})
 
 	return &buf
+}
+
+// TestRunnerRestoreHappensBeforeRunIsStarted pins the ordering M5 is about.
+// The cache is on the disk precisely so a head that boots to an unreachable
+// Gentility serves the netmaps it last rendered; run is a goroutine and the
+// listeners come up beside it, so a restore made as run's first statement is
+// one a first poll can beat. Loading it is the caller's move, made before the
+// goroutine exists.
+func TestRunnerRestoreHappensBeforeRunIsStarted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	cursor := int64(9)
+
+	require.NoError(t, saveRegistryCache(path, registryCache{
+		Cursor: &cursor,
+		Worlds: map[string]*registry.World{"3": cachedWorld("3")},
+	}))
+
+	gentility := newFakeGentility(nil)
+	server := serve(t, gentility)
+
+	cache := newFakeWorldCache()
+	runner, _ := testRunner(t, server, cache, path)
+
+	// Nothing has run yet.
+	require.Empty(t, cache.taken())
+
+	runner.restore()
+
+	assert.Equal(t, []string{"load"}, cache.taken(),
+		"the disk cache is in place before the runner is started")
+
+	cache.mu.Lock()
+	assert.Equal(t, map[types.NodeID]*registry.World{types.NodeID(3): cachedWorld("3")}, cache.loaded)
+	cache.mu.Unlock()
+
+	require.NotNil(t, runner.cursor)
+	assert.Equal(t, int64(9), *runner.cursor)
 }

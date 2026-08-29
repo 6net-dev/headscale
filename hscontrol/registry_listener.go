@@ -153,10 +153,10 @@ func newRegistryRunner(
 	}
 }
 
-// run restores the cache, then follows the stream until ctx is cancelled.
+// run follows the stream until ctx is cancelled. [registryRunner.restore] is
+// the caller's move and is made BEFORE this one: see there for why it cannot
+// be the first thing this goroutine does.
 func (r *registryRunner) run(ctx context.Context) {
-	r.restore()
-
 	wait := r.backoff
 
 	for ctx.Err() == nil {
@@ -279,6 +279,14 @@ func (r *registryRunner) behindHorizon(err error) bool {
 
 // restore puts the last cache back before the first connection, so a head that
 // boots to an unreachable Gentility has the netmaps it last rendered.
+//
+// It is called by the caller, synchronously, before [registryRunner.run] is
+// started — not as run's own first statement. run is a goroutine, and the
+// head starts listening at the same moment: a poll that arrives before the
+// scheduler reaches this would be answered from an EMPTY cache. Which is a
+// full round of on-demand fetches at best, and at worst — the boot into an
+// unreachable Gentility this file is entirely about — a withheld map response
+// for a node whose document is sitting on the disk unread.
 //
 // A cache it cannot read is a cold start rather than a failed one: everything
 // in it can be asked for again, so the cost is one full round of on-demand

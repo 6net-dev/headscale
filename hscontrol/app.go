@@ -716,6 +716,12 @@ func (h *Headscale) Serve() error {
 			h.cfg.RegistryCachePath,
 		)
 
+		// Synchronously, before the goroutine and before the listeners
+		// below: the disk cache is what a head booting into an
+		// unreachable Gentility serves from, and a poll that beat the
+		// scheduler to it would be answered from an empty one.
+		runner.restore()
+
 		go runner.run(scheduleCtx)
 	}
 

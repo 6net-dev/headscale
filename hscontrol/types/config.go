@@ -117,6 +117,12 @@ type Config struct {
 	// by resolveRegistryBearer.
 	RegistryBearer string `json:"-"` // never serialise the registry secret
 
+	// RegistryCachePath is where the head persists its World cache and its
+	// change-stream cursor (design §4). It must be on a volume that
+	// survives a restart: the file is what lets a head that comes back to
+	// an unreachable Gentility serve the netmaps it last rendered.
+	RegistryCachePath string
+
 	IPAllocation        IPAllocationStrategy
 	NoisePrivateKeyPath string
 	BaseDomain          string
@@ -1151,8 +1157,14 @@ func resolveRegistryBearer() (string, error) {
 	return strings.TrimSpace(string(secret)), nil
 }
 
-// resolveRegistry is the registry channel's two settings together, because
-// neither is usable alone.
+// defaultRegistryCachePath is where the persisted World cache lives when a
+// deployment does not say. It sits under the same state directory the SQLite
+// database and the noise key do, because it is state of the same kind: losing
+// it is survivable but never free.
+const defaultRegistryCachePath = "/var/lib/headscale/registry-cache.json"
+
+// resolveRegistry is the registry channel's settings together, because the
+// first two are not usable alone.
 //
 // A registry named without a bearer refuses to boot. The bearer is the whole
 // of the head's authority here (§2.3 authenticates both directions with it),
@@ -1163,18 +1175,23 @@ func resolveRegistryBearer() (string, error) {
 // A bearer with no url is inert rather than wrong: nothing reads it, and
 // refusing would break a deployment that stages the secret ahead of the
 // cutover.
-func resolveRegistry() (string, string, error) {
+func resolveRegistry() (string, string, string, error) {
 	bearer, err := resolveRegistryBearer()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	url := viper.GetString("registry.url")
 	if url != "" && bearer == "" {
-		return "", "", errRegistryBearerRequired
+		return "", "", "", errRegistryBearerRequired
 	}
 
-	return url, bearer, nil
+	cachePath := viper.GetString("registry.cache_path")
+	if cachePath == "" {
+		cachePath = defaultRegistryCachePath
+	}
+
+	return url, bearer, cachePath, nil
 }
 
 // LoadServerConfig returns the full Headscale configuration to
@@ -1270,7 +1287,7 @@ func LoadServerConfig() (*Config, error) {
 		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
-	registryURL, registryBearer, err := resolveRegistry()
+	registryURL, registryBearer, registryCachePath, err := resolveRegistry()
 	if err != nil {
 		return nil, err
 	}
@@ -1300,11 +1317,12 @@ func LoadServerConfig() (*Config, error) {
 		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
-		PrefixV4:       prefix4,
-		PrefixV6:       prefix6,
-		RegistryURL:    registryURL,
-		RegistryBearer: registryBearer,
-		IPAllocation:   alloc,
+		PrefixV4:          prefix4,
+		PrefixV6:          prefix6,
+		RegistryURL:       registryURL,
+		RegistryBearer:    registryBearer,
+		RegistryCachePath: registryCachePath,
+		IPAllocation:      alloc,
 
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
 			viper.GetString("noise.private_key_path"),

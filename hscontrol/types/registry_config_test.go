@@ -136,7 +136,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("no registry at all", func(t *testing.T) {
 		withViper(t, nil)
 
-		gotURL, gotBearer, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry()
 		require.NoError(t, err)
 		assert.Empty(t, gotURL)
 		assert.Empty(t, gotBearer)
@@ -145,7 +145,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a url and a bearer", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		gotURL, gotBearer, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry()
 		require.NoError(t, err)
 		assert.Equal(t, url, gotURL)
 		assert.Equal(t, bearer, gotBearer)
@@ -154,7 +154,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a url with no bearer refuses to boot", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url})
 
-		_, _, err := resolveRegistry()
+		_, _, _, err := resolveRegistry()
 		require.ErrorIs(t, err, errRegistryBearerRequired)
 	})
 
@@ -163,9 +163,41 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a bearer with no url is inert", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.bearer": bearer})
 
-		gotURL, gotBearer, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry()
 		require.NoError(t, err)
 		assert.Empty(t, gotURL)
 		assert.Equal(t, bearer, gotBearer)
+	})
+}
+
+// The cache path is where the head's persisted World cache and change cursor
+// live (design §4: "the head persists its cache to disk"). It has a default
+// because a head that lost it would silently fall back to full refreshes on
+// every boot, which looks like nothing at all until the installation is big
+// enough for it to matter.
+func TestResolveRegistryCachePath(t *testing.T) {
+	const (
+		bearer = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
+		url    = "https://gentility.example"
+	)
+
+	t.Run("unset falls back to the default", func(t *testing.T) {
+		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
+
+		_, _, path, err := resolveRegistry()
+		require.NoError(t, err)
+		assert.Equal(t, defaultRegistryCachePath, path)
+	})
+
+	t.Run("set is honoured", func(t *testing.T) {
+		withViper(t, map[string]any{
+			"registry.url":        url,
+			"registry.bearer":     bearer,
+			"registry.cache_path": "/srv/head/cache.json",
+		})
+
+		_, _, path, err := resolveRegistry()
+		require.NoError(t, err)
+		assert.Equal(t, "/srv/head/cache.json", path)
 	})
 }

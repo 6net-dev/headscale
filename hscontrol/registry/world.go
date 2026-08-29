@@ -44,7 +44,13 @@ type World struct {
 
 	// DERPMap is configuration, passed through verbatim rather than
 	// re-derived here.
-	DERPMap json.RawMessage `json:"derp_map"`
+	//
+	// omitempty because this document is not only decoded: the head writes
+	// its World cache back to disk, and without it an absent map would come
+	// back off the disk as the four bytes "null" rather than as absent.
+	// Nothing downstream can tell the two apart, but a cache that does not
+	// round-trip exactly is a cache nobody can compare against the wire.
+	DERPMap json.RawMessage `json:"derp_map,omitempty"`
 }
 
 // RendererVersion1 is the only World shape this head understands.

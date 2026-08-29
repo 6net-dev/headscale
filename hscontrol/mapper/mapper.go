@@ -72,6 +72,11 @@ type mapper struct {
 	worldTTL time.Duration
 	now      func() time.Time
 
+	// worldGen is the ready gate: the connection to Gentility a cached
+	// World was last read for. An entry from an earlier generation is
+	// never served as it stands. See [mapper.beginWorldRefresh].
+	worldGen uint64
+
 	created time.Time
 }
 
@@ -104,6 +109,12 @@ func newMapper(
 		m.worldCache = make(map[types.NodeID]cachedWorld)
 		m.worldTTL = defaultWorldTTL
 		m.now = time.Now
+
+		// One, not zero: a World loaded off the disk is stamped with
+		// the generation BEFORE the first, so a head that has not yet
+		// spoken to Gentility on this run re-reads everything it
+		// restored before serving any of it.
+		m.worldGen = 1
 	}
 
 	return m

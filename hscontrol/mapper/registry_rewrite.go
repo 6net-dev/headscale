@@ -49,11 +49,19 @@ var registryRewriteWithheld = promauto.NewCounter(prometheus.CounterOpts{
 	Help:      "total count of map responses withheld because no sealed world could be applied",
 })
 
-// cachedWorld is one remembered document and when it was read, since a copy of
-// something that moves is only as good as its age.
+// cachedWorld is one remembered document, when it was read, and which
+// connection to Gentility it was read for. A copy of something that moves is
+// only as good as its age — and, on this channel, only as good as the
+// connection it was read over.
 type cachedWorld struct {
 	world *registry.World
 	at    time.Time
+
+	// gen is the refresh generation the entry was last READ FOR, which a
+	// failed read counts towards as much as a successful one. See
+	// [mapper.beginWorldRefresh] for what the generation buys and
+	// [mapper.peerWorld] for why a failure stamps it.
+	gen uint64
 }
 
 // peerFate is what one round of the rewrite can say about one peer.
@@ -241,6 +249,12 @@ func (m *mapper) peerWorld(nodeID types.NodeID) (*registry.World, peerFate) {
 				Uint64("peer.id", nodeID.Uint64()).
 				Msg("registry world fetch failed for peer; serving it as last seen")
 
+			// Stamped as read for this connection, though nothing was
+			// read: this IS the answer for as long as the outage
+			// lasts, and leaving it unstamped would have every
+			// subsequent build re-ask a Gentility that is not there.
+			m.keepWorld(nodeID)
+
 			return cached, peerKnown
 		}
 
@@ -272,15 +286,19 @@ func (m *mapper) peerWorld(nodeID types.NodeID) (*registry.World, peerFate) {
 // enforcing it wrongly is worse than serving nothing.
 func supportedWorld(world *registry.World) error {
 	if world.RendererVersion != registry.RendererVersion1 {
-		return fmt.Errorf("registry: unsupported renderer version %d", world.RendererVersion)
+		return fmt.Errorf("%w: %d", errUnsupportedWorld, world.RendererVersion)
 	}
 
 	return nil
 }
 
-// cachedWorld returns the remembered World and whether it is still inside its
-// TTL. A stale entry is still returned: it is what a failed re-read falls back
-// on.
+// errUnsupportedWorld is an ANSWER rather than an outage: reading the document
+// again would return the same shape.
+var errUnsupportedWorld = errors.New("registry: unsupported renderer version")
+
+// cachedWorld returns the remembered World and whether it may be served as it
+// stands: read for THIS connection to Gentility, and still inside its TTL. A
+// stale entry is still returned — it is what a failed re-read falls back on.
 func (m *mapper) cachedWorld(nodeID types.NodeID) (*registry.World, bool) {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
@@ -290,14 +308,171 @@ func (m *mapper) cachedWorld(nodeID types.NodeID) (*registry.World, bool) {
 		return nil, false
 	}
 
-	return entry.world, m.now().Sub(entry.at) < m.worldTTL
+	return entry.world, entry.gen == m.worldGen && m.now().Sub(entry.at) < m.worldTTL
 }
 
 func (m *mapper) cacheWorld(nodeID types.NodeID, world *registry.World) {
 	m.worldCacheMu.Lock()
 	defer m.worldCacheMu.Unlock()
 
-	m.worldCache[nodeID] = cachedWorld{world: world, at: m.now()}
+	m.worldCache[nodeID] = cachedWorld{world: world, at: m.now(), gen: m.worldGen}
+}
+
+// beginWorldRefresh opens a new refresh generation, which is the READY GATE
+// design §4 asks for: "on any (re)connect ... refreshes every cached node
+// before serving".
+//
+// # What the gate does, exactly
+//
+// Every entry cached before this call is now unrefreshed, so [mapper.cachedWorld]
+// will not report one as servable however young it is. A map build that names
+// such a node therefore READS IT AGAIN before answering, and no response can
+// be assembled out of a World cached over a connection that has since dropped.
+// That is the whole of the guarantee, and it is per node rather than global:
+// the head goes on serving throughout, and what it serves is current.
+//
+// # What the gate deliberately does not do
+//
+// It does not withhold. A node with NO cached World is fetched on demand
+// exactly as before — there is nothing stale to withhold — and a node whose
+// re-read fails is served from the cache, because fail-static is the stated
+// behaviour of a head cut off from Gentility (design §4) and a gate that
+// refused instead would contradict it.
+//
+// [mapper.refreshWorlds] is the sweep that follows: it warms every entry back
+// into the new generation so those re-reads have already happened by the time
+// a build needs them.
+func (m *mapper) beginWorldRefresh() {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	m.worldGen++
+}
+
+// refreshWorlds opens a generation and reads every cached World again. It is
+// what the change-stream runner calls on each (re)connect, before it serves a
+// single event.
+//
+// A node Gentility refuses — unknown, revoked, nothing rendered, a shape this
+// head cannot enforce — is FORGOTTEN rather than re-read: those are answers,
+// and the answer is that there is no document here. A node it merely could not
+// be reached about keeps its entry and is stamped into the new generation, so
+// an unreachable Gentility is asked once per TTL rather than once per build.
+func (m *mapper) refreshWorlds(ctx context.Context) {
+	if m.regClient == nil {
+		return
+	}
+
+	m.beginWorldRefresh()
+
+	for _, nodeID := range m.cachedNodes() {
+		m.refreshWorld(ctx, nodeID)
+	}
+}
+
+func (m *mapper) refreshWorld(ctx context.Context, nodeID types.NodeID) {
+	ctx, cancel := context.WithTimeout(ctx, registryPeerTimeout)
+	defer cancel()
+
+	world, err := m.regClient.World(ctx, registry.NodeID(nodeID.Uint64()))
+	if err == nil {
+		err = supportedWorld(world)
+	}
+
+	switch {
+	case err == nil:
+		m.cacheWorld(nodeID, world)
+	case answered(err):
+		log.Info().
+			Err(err).
+			Uint64("node.id", nodeID.Uint64()).
+			Msg("registry has no world for a cached node; forgetting it")
+
+		m.invalidateWorld(nodeID)
+	default:
+		log.Warn().
+			Err(err).
+			Uint64("node.id", nodeID.Uint64()).
+			Msg("registry world refresh failed; keeping the world as last seen")
+
+		m.keepWorld(nodeID)
+	}
+}
+
+// answered says whether an error is Gentility's answer about a node rather
+// than a failure to hear one. The two call for opposite handling everywhere on
+// this channel, so the distinction is named once.
+func answered(err error) bool {
+	return errors.Is(err, registry.ErrUnknownNode) ||
+		errors.Is(err, registry.ErrNotRendered) ||
+		errors.Is(err, errUnsupportedWorld)
+}
+
+// keepWorld stamps an existing entry into the current generation without
+// changing the document: the read was attempted and this is the best answer
+// there is. Without it, an outage would have every map build re-read every
+// peer, since nothing would ever become servable again.
+func (m *mapper) keepWorld(nodeID types.NodeID) {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	entry, ok := m.worldCache[nodeID]
+	if !ok {
+		return
+	}
+
+	entry.at = m.now()
+	entry.gen = m.worldGen
+	m.worldCache[nodeID] = entry
+}
+
+func (m *mapper) cachedNodes() []types.NodeID {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	ids := make([]types.NodeID, 0, len(m.worldCache))
+	for nodeID := range m.worldCache {
+		ids = append(ids, nodeID)
+	}
+
+	return ids
+}
+
+// snapshotWorlds is the cache as it stands, for the runner to persist.
+func (m *mapper) snapshotWorlds() map[types.NodeID]*registry.World {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	if m.worldCache == nil {
+		return nil
+	}
+
+	worlds := make(map[types.NodeID]*registry.World, len(m.worldCache))
+	for nodeID, entry := range m.worldCache {
+		worlds[nodeID] = entry.world
+	}
+
+	return worlds
+}
+
+// loadWorlds seeds the cache from disk at boot, as UNREFRESHED documents: the
+// head has not spoken to Gentility on this run, so every one of them is read
+// again before it is served, and stands as it is only if that read fails.
+func (m *mapper) loadWorlds(worlds map[types.NodeID]*registry.World) {
+	m.worldCacheMu.Lock()
+	defer m.worldCacheMu.Unlock()
+
+	if m.worldCache == nil {
+		return
+	}
+
+	for nodeID, world := range worlds {
+		if world == nil {
+			continue
+		}
+
+		m.worldCache[nodeID] = cachedWorld{world: world, at: m.now(), gen: m.worldGen - 1}
+	}
 }
 
 // invalidateWorld forgets one node's cached World. It is the seam the change

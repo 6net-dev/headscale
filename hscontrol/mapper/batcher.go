@@ -1,12 +1,14 @@
 package mapper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -61,6 +63,41 @@ func (b *Batcher) InvalidateWorld(nodeID types.NodeID) {
 	}
 
 	b.mapper.invalidateWorld(nodeID)
+}
+
+// RefreshWorlds opens a new refresh generation and reads every cached World
+// again. The change-stream runner calls it on each (re)connect, before it
+// serves an event: a reconnect is the window in which the head may have missed
+// a change, so nothing cached over the connection that dropped may be served
+// as it stands. [mapper.beginWorldRefresh] documents the gate exactly.
+func (b *Batcher) RefreshWorlds(ctx context.Context) {
+	if b.mapper == nil || b.mapper.worldCache == nil {
+		return
+	}
+
+	b.mapper.refreshWorlds(ctx)
+}
+
+// SnapshotWorlds is the cached World per node, for the runner to persist to
+// disk. Nil when this head has no registry.
+func (b *Batcher) SnapshotWorlds() map[types.NodeID]*registry.World {
+	if b.mapper == nil {
+		return nil
+	}
+
+	return b.mapper.snapshotWorlds()
+}
+
+// LoadWorlds seeds the cache from disk at boot. What is loaded is UNREFRESHED:
+// it is read again on the first connection before it is served, and stands as
+// it is only if that read fails — which is the fail-static behaviour a head
+// that boots to an unreachable Gentility is meant to have.
+func (b *Batcher) LoadWorlds(worlds map[types.NodeID]*registry.World) {
+	if b.mapper == nil || b.mapper.worldCache == nil {
+		return
+	}
+
+	b.mapper.loadWorlds(worlds)
 }
 
 // NewBatcherAndMapper creates a new [Batcher] with its [mapper].

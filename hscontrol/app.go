@@ -33,6 +33,7 @@ import (
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -691,19 +692,22 @@ func (h *Headscale) Serve() error {
 		zerolog.RespLog = false
 	}
 
-	// TODO(B6): start the registry change stream here.
-	//
-	// The v0 listener that lived at this line spoke the pre-contract
-	// /api/changes endpoint and fanned a change.FullUpdate() to every
-	// connected device on any world change, which is a wake-up for
-	// devices whose World did not move. Its replacement is
-	// registry.Client.Changes: subscribe with the persisted cursor (nil
-	// for a head with no cache, which asks for the tail), refresh every
-	// cached World on Connected, and send change.FullSelf for the one
-	// node each event names. Task B6 of
-	// docs/plans/2026-08-28-overlay-phase1-s2-renderer-head.md carries
-	// the persisted cache and the reconnect rules; the cache seam it
-	// invalidates against is Batcher.InvalidateWorld.
+	// The change stream: how a grant change reaches a device. It owns its
+	// own client rather than sharing the mapper's, because the two want
+	// different bounds on the same channel — the mapper's calls are short
+	// and deadlined, and this one is a connection whose whole purpose is
+	// to stay open. [registryRunner] carries the cursor, the persisted
+	// cache and the refresh-on-connect gate.
+	if h.cfg.RegistryURL != "" {
+		runner := newRegistryRunner(
+			registry.New(h.cfg.RegistryURL, h.cfg.RegistryBearer),
+			h.mapBatcher,
+			h.Change,
+			h.cfg.RegistryCachePath,
+		)
+
+		go runner.run(scheduleCtx)
+	}
 
 	// Prepare group for running listeners
 	errorGroup := new(errgroup.Group)

@@ -2537,6 +2537,10 @@ func (s *State) HandleNodeFromPreAuthKey(
 		// valid after the mutation.
 		priorNode := existingNodeSameUser.AsStruct()
 
+		// The key being replaced, read before anything replaces it. It is
+		// half of what a rotation is, and the write below reports it.
+		priorNodeKey := existingNodeSameUser.NodeKey()
+
 		// Update existing node - NodeStore first, then database
 		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeSameUser.ID(), func(node *types.Node) {
 			node.NodeKey = regReq.NodeKey
@@ -2644,6 +2648,18 @@ func (s *State) HandleNodeFromPreAuthKey(
 				err = hsdb.UsePreAuthKey(tx, pak)
 				if err != nil {
 					return nil, fmt.Errorf("using pre auth key: %w", err)
+				}
+			}
+
+			// Gentility records the rotation before the head commits it
+			// (design §4 channel 4): it closes the previous key's
+			// interval and opens the next, and a head that committed
+			// first would hold a key Gentility could not attribute.
+			// Returning an error here rolls the row back, and the
+			// priorNode restore below rolls the NodeStore back with it.
+			if isNodeKeyRotation {
+				if err := s.recordRotation(existingNodeSameUser.ID(), priorNodeKey, regReq.NodeKey); err != nil { //nolint:noinlineerr
+					return nil, err
 				}
 			}
 

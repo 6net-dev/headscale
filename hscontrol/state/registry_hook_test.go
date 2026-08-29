@@ -86,6 +86,13 @@ func (f *fakeRegistry) answers(status int, body string) {
 	f.status, f.body = status, body
 }
 
+func (f *fakeRegistry) refusesRotation(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.rotateStatus = status
+}
+
 func (f *fakeRegistry) recorded() ([]registry.Registration, []registry.Rotation) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -324,4 +331,121 @@ func assertNoNodes(t *testing.T, s *State) {
 	assert.Empty(t, nodes, "a refused registration must leave no node row")
 
 	assert.Equal(t, 0, s.nodeStore.ListNodes().Len(), "a refused registration must leave nothing in the NodeStore")
+}
+
+// TestRegistryRotationRecordedBeforeCommit: a node that comes back with a new
+// node key is a rotation, and the head does not commit the new key until
+// Gentility has been told which key replaced which (design §4 channel 4).
+func TestRegistryRotationRecordedBeforeCommit(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	oldKey := key.NewNode()
+	newKey := key.NewNode()
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	rotated, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, newKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+	require.Equal(t, node.ID(), rotated.ID(), "a rotation moves a key, not a node")
+
+	_, rotations := fake.recorded()
+	require.Len(t, rotations, 1)
+	assert.Equal(t, registry.Rotation{
+		HeadNodeID: registry.NodeID(node.ID().Uint64()),
+		OldKey:     oldKey.Public().String(),
+		NewKey:     newKey.Public().String(),
+	}, rotations[0])
+
+	assertNodeKey(t, s, node.ID(), newKey.Public())
+}
+
+// TestRegistryRotationRefusalKeepsTheOldKey: a rotation the record
+// contradicts is refused, and the head is left exactly as it was — the row,
+// and the NodeStore snapshot the poll answers from.
+func TestRegistryRotationRefusalKeepsTheOldKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status  int
+		isPAK   bool
+		message string
+	}{
+		"refused":      {http.StatusConflict, true, "node key rotation refused by the registry"},
+		"unknown node": {http.StatusNotFound, true, "the registry does not know this node"},
+		"outage":       {http.StatusInternalServerError, false, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeRegistry(t)
+			s, pak, _ := registryTestState(t, fake)
+
+			machineKey := key.NewMachine()
+			oldKey := key.NewNode()
+
+			node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+			require.NoError(t, err)
+
+			fake.refusesRotation(tc.status)
+
+			_, _, err = s.HandleNodeFromPreAuthKey(
+				registerRequest(pak, key.NewNode().Public()),
+				machineKey.Public(),
+			)
+			require.Error(t, err)
+
+			pakErr, isPAK := errors.AsType[types.PAKError](err)
+			assert.Equal(t, tc.isPAK, isPAK, "got %v", err)
+
+			if tc.isPAK {
+				assert.Equal(t, tc.message, pakErr.Error())
+			}
+
+			assertNodeKey(t, s, node.ID(), oldKey.Public())
+		})
+	}
+}
+
+// TestRegistryRotationIdempotentRetry: the same rotation offered twice is
+// recorded twice and refused neither time — Gentility is idempotent on the new
+// key, which is what makes a retry after a lost response safe.
+func TestRegistryRotationIdempotentRetry(t *testing.T) {
+	fake := newFakeRegistry(t)
+	s, pak, _ := registryTestState(t, fake)
+
+	machineKey := key.NewMachine()
+	oldKey := key.NewNode()
+	newKey := key.NewNode()
+
+	_, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, oldKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	fake.refusesRotation(http.StatusInternalServerError)
+
+	_, _, err = s.HandleNodeFromPreAuthKey(registerRequest(pak, newKey.Public()), machineKey.Public())
+	require.Error(t, err)
+
+	fake.refusesRotation(http.StatusNoContent)
+
+	node, _, err := s.HandleNodeFromPreAuthKey(registerRequest(pak, newKey.Public()), machineKey.Public())
+	require.NoError(t, err)
+
+	_, rotations := fake.recorded()
+	require.Len(t, rotations, 2)
+	assert.Equal(t, rotations[0], rotations[1], "the retry is the same rotation, old key and all")
+
+	assertNodeKey(t, s, node.ID(), newKey.Public())
+}
+
+// assertNodeKey checks the key the head would serve and the key it would
+// reload, which a rollback has to leave agreeing.
+func assertNodeKey(t *testing.T, s *State, id types.NodeID, want key.NodePublic) {
+	t.Helper()
+
+	stored, err := s.DB().GetNodeByID(id)
+	require.NoError(t, err)
+	assert.Equal(t, want, stored.NodeKey, "the row must hold this key")
+
+	cached, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+	assert.Equal(t, want, cached.NodeKey(), "the NodeStore must hold this key")
 }

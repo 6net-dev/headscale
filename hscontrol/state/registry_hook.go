@@ -9,6 +9,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
+	"tailscale.com/types/key"
 )
 
 // RegistryHook is called inside the node write's transaction. A registration
@@ -138,5 +139,44 @@ func registrationRefusal(err error) error {
 		return fmt.Errorf("%w: %w", types.PAKError("authkey is bound to a different machine"), err)
 	default:
 		return fmt.Errorf("recording registration: %w", err)
+	}
+}
+
+// recordRotation reports a node key rotation to Gentility from inside the
+// write that applies it (design §4 channel 4). The caller returns its error,
+// which rolls the update back — row and NodeStore alike.
+//
+// Idempotent on the new key: a retry after a lost response offers the same
+// (old, new) pair and is answered 204 again, so a head whose transaction
+// failed simply tries the whole thing once more.
+func (s *State) recordRotation(nodeID types.NodeID, oldKey, newKey key.NodePublic) error {
+	if s.registry == nil {
+		return nil
+	}
+
+	err := s.registry.Rotated(context.Background(), registry.Rotation{
+		HeadNodeID: registry.NodeID(nodeID.Uint64()),
+		OldKey:     oldKey.String(),
+		NewKey:     newKey.String(),
+	})
+	if err != nil {
+		return rotationRefusal(err)
+	}
+
+	return nil
+}
+
+// rotationRefusal is [registrationRefusal]'s counterpart for §2.3's rotate
+// column, which has two refusals rather than four and the same rule behind
+// them: a contradiction of the record is final and is reported to the client,
+// anything else is transient and is retried.
+func rotationRefusal(err error) error {
+	switch {
+	case errors.Is(err, registry.ErrUnknownNode):
+		return fmt.Errorf("%w: %w", types.PAKError("the registry does not know this node"), err)
+	case errors.Is(err, registry.ErrRefused):
+		return fmt.Errorf("%w: %w", types.PAKError("node key rotation refused by the registry"), err)
+	default:
+		return fmt.Errorf("recording node key rotation: %w", err)
 	}
 }

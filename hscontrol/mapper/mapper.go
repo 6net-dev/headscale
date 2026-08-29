@@ -77,6 +77,12 @@ type mapper struct {
 	// never served as it stands. See [mapper.beginWorldRefresh].
 	worldGen uint64
 
+	// baseDomainOnce keeps [mapper.reportBaseDomain] to one Error for the
+	// life of the process: a config that disagrees with the registry
+	// disagrees on every World, and an alarm repeated per map build is one
+	// nobody reads.
+	baseDomainOnce sync.Once
+
 	created time.Time
 }
 

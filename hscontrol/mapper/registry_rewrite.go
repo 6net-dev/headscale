@@ -147,7 +147,7 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 
 	if resp.Node != nil {
 		applyWorldAddresses(resp.Node, world.Addresses)
-		applyWorldName(resp.Node, world.Names, 0, m.baseDomain())
+		applyWorldName(resp.Node, world.Names, 0, m.worldBaseDomain(world))
 	}
 
 	// Peers dropped by the rewrite must be announced in PeersRemoved:
@@ -160,7 +160,7 @@ func (m *mapper) rewriteFromRegistry(nodeID types.NodeID, resp *tailcfg.MapRespo
 	resp.PeersRemoved = append(resp.PeersRemoved, removed...)
 	resp.PeersChangedPatch = m.keepVisiblePatches(resp.PeersChangedPatch, visible)
 
-	applyWorldDNS(resp, world, m.baseDomain())
+	applyWorldDNS(resp, world, m.worldBaseDomain(world))
 	applyWorldFilters(resp, world)
 	applyWorldDERPMap(resp, world)
 
@@ -173,6 +173,53 @@ func (m *mapper) baseDomain() string {
 	}
 
 	return m.cfg.BaseDomain
+}
+
+// worldBaseDomain is the name space one World's names live in.
+//
+// The World's own answer wins. Gentility composes every name under its
+// OVERLAY_BASE_DOMAIN and says so in the document, so the head reading its
+// own dns.base_domain instead would be one identity owned by two systems,
+// agreeing only for as long as two configurations happen to match. The
+// config is the fallback for a Gentility that does not send one yet.
+//
+// It is per-World rather than per-head because a peer is named under the
+// document that names IT: the head is a consumer of both answers and has no
+// business preferring the viewer's.
+func (m *mapper) worldBaseDomain(world *registry.World) string {
+	configured := m.baseDomain()
+
+	if world == nil || world.BaseDomain == "" {
+		return configured
+	}
+
+	m.reportBaseDomain(world.BaseDomain, configured)
+
+	return world.BaseDomain
+}
+
+// reportBaseDomain says once, at Error, that the head and Gentility disagree
+// about the name space. config-example requires them equal: the head's
+// `dns.base_domain` must be the registry's OVERLAY_BASE_DOMAIN.
+//
+// It is not fatal, and deliberately so. The World's answer is used, so the
+// netmap is still sealed and still names its nodes correctly; what a
+// disagreement really breaks is everything ELSE the head composes from its
+// own config. So this is an operator's alarm, not a refusal — and it fires
+// once rather than once per map build, because a per-build Error on a busy
+// head is a log nobody reads.
+func (m *mapper) reportBaseDomain(rendered, configured string) {
+	if rendered == configured {
+		return
+	}
+
+	m.baseDomainOnce.Do(func() {
+		log.Error().
+			Str("world.base_domain", rendered).
+			Str("config.base_domain", configured).
+			Msg("the registry renders names under a different base domain than dns.base_domain; " +
+				"they must be equal — serving the registry's")
+	})
 }
 
 // fetchWorld reads a node's own World fresh, because it is the document this
@@ -580,6 +627,9 @@ func applyWorldDNS(resp *tailcfg.MapResponse, world *registry.World, baseDomain 
 // searchDomains is one domain per organization the node is named in, in the
 // order the World lists them — which is the renderer's organization order, so
 // a node's primary organization is searched first.
+//
+// baseDomain is [mapper.worldBaseDomain]: the space the World itself names,
+// and the head's own dns.base_domain only where the World names none.
 func searchDomains(names []registry.Name, baseDomain string) []string {
 	if baseDomain == "" {
 		return nil
@@ -700,7 +750,11 @@ func applyWorldName(node *tailcfg.Node, names []registry.Name, index int, baseDo
 // Gentility sends the composed name in Fqdn where it has one, and that is the
 // answer: the renderer is what knows what a name is made of. Composing
 // "<label>.<org>.<base_domain>." here is the fallback for a Gentility that
-// does not send it yet, and it needs a base domain to compose from.
+// does not send it yet, and it needs a base domain to compose from — which is
+// [mapper.worldBaseDomain]: the World's own base_domain, and the head's
+// dns.base_domain only where that too is absent. Composing under the head's
+// config in preference to the renderer's answer is exactly the split identity
+// the top-level base_domain exists to close.
 func nameAt(names []registry.Name, index int, baseDomain string) string {
 	if index < 0 || index >= len(names) {
 		return ""
@@ -755,7 +809,7 @@ func (m *mapper) rewriteWorldPeers(
 		}
 
 		applyWorldAddresses(peer, seen)
-		applyWorldName(peer, world.Names, org, m.baseDomain())
+		applyWorldName(peer, world.Names, org, m.worldBaseDomain(world))
 		kept = append(kept, peer)
 	}
 

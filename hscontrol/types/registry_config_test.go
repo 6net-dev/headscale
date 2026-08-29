@@ -129,14 +129,15 @@ func withViper(t *testing.T, settings map[string]any) {
 // start.
 func TestResolveRegistry(t *testing.T) {
 	const (
-		bearer = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
-		url    = "https://gentility.example"
+		bearer     = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
+		url        = "https://gentility.example"
+		baseDomain = "overlay.example"
 	)
 
 	t.Run("no registry at all", func(t *testing.T) {
 		withViper(t, nil)
 
-		gotURL, gotBearer, _, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
 		assert.Empty(t, gotURL)
 		assert.Empty(t, gotBearer)
@@ -145,7 +146,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a url and a bearer", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		gotURL, gotBearer, _, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
 		assert.Equal(t, url, gotURL)
 		assert.Equal(t, bearer, gotBearer)
@@ -154,8 +155,30 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a url with no bearer refuses to boot", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url})
 
-		_, _, _, err := resolveRegistry()
+		_, _, _, err := resolveRegistry(baseDomain)
 		require.ErrorIs(t, err, errRegistryBearerRequired)
+	})
+
+	// The rendered World composes its names under the registry's own base
+	// domain, and the head needs the same one to build the search domains it
+	// hands a client and to compose a name for a World that carries none.
+	// A head with no base domain at all would serve nodes no search domain
+	// and, on that fallback, no name — a control plane that starts and then
+	// resolves nothing.
+	t.Run("a url with no base domain refuses to boot", func(t *testing.T) {
+		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
+
+		_, _, _, err := resolveRegistry("")
+		require.ErrorIs(t, err, errRegistryBaseDomainRequired)
+	})
+
+	// No registry, no requirement: upstream headscale runs happily with no
+	// base domain at all.
+	t.Run("no base domain is fine without a registry", func(t *testing.T) {
+		withViper(t, nil)
+
+		_, _, _, err := resolveRegistry("")
+		require.NoError(t, err)
 	})
 
 	// A bearer with no url is inert rather than wrong: nothing reads it,
@@ -163,7 +186,7 @@ func TestResolveRegistry(t *testing.T) {
 	t.Run("a bearer with no url is inert", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.bearer": bearer})
 
-		gotURL, gotBearer, _, err := resolveRegistry()
+		gotURL, gotBearer, _, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
 		assert.Empty(t, gotURL)
 		assert.Equal(t, bearer, gotBearer)
@@ -177,14 +200,15 @@ func TestResolveRegistry(t *testing.T) {
 // enough for it to matter.
 func TestResolveRegistryCachePath(t *testing.T) {
 	const (
-		bearer = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
-		url    = "https://gentility.example"
+		bearer     = "bearer-from-config-marker" //nolint:gosec // test marker, not a real credential
+		url        = "https://gentility.example"
+		baseDomain = "overlay.example"
 	)
 
 	t.Run("unset falls back to the default", func(t *testing.T) {
 		withViper(t, map[string]any{"registry.url": url, "registry.bearer": bearer})
 
-		_, _, path, err := resolveRegistry()
+		_, _, path, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
 		assert.Equal(t, defaultRegistryCachePath, path)
 	})
@@ -196,7 +220,7 @@ func TestResolveRegistryCachePath(t *testing.T) {
 			"registry.cache_path": "/srv/head/cache.json",
 		})
 
-		_, _, path, err := resolveRegistry()
+		_, _, path, err := resolveRegistry(baseDomain)
 		require.NoError(t, err)
 		assert.Equal(t, "/srv/head/cache.json", path)
 	})

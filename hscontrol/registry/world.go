@@ -34,13 +34,26 @@ func NodeID(id uint64) string {
 // node's own Addresses — and each peer's addresses and names come from that
 // peer's own World, which the head fetches by head node id and caches.
 type World struct {
-	RendererVersion int      `json:"renderer_version"`
-	Revision        int64    `json:"revision"`
-	HeadNodeID      string   `json:"head_node_id"`
-	Addresses       []string `json:"addresses"`
-	Names           []Name   `json:"names"`
-	DNS             []Record `json:"dns"`
-	Filters         []Filter `json:"filters"`
+	RendererVersion int    `json:"renderer_version"`
+	Revision        int64  `json:"revision"`
+	HeadNodeID      string `json:"head_node_id"`
+
+	// BaseDomain is the name space this document's names live in, carried
+	// at the top level because the head needs the space ITSELF — the search
+	// domains it hands a client are one per organization under it — and
+	// deriving it back out of an Fqdn would be a second answer to what the
+	// base domain is.
+	//
+	// It is the renderer's answer and it wins: the head's own
+	// dns.base_domain stands in only for a Gentility that does not send one
+	// yet. The two must be equal (config-example says so), and a head that
+	// meets a World disagreeing with its config says so once, at Error.
+	BaseDomain string `json:"base_domain"`
+
+	Addresses []string `json:"addresses"`
+	Names     []Name   `json:"names"`
+	DNS       []Record `json:"dns"`
+	Filters   []Filter `json:"filters"`
 
 	// DERPMap is configuration, passed through verbatim rather than
 	// re-derived here.

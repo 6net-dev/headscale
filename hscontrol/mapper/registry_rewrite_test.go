@@ -1,10 +1,12 @@
 package mapper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/registry"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -849,4 +853,124 @@ func TestRewriteKeepsTheDERPMapOnAnUnreadableOne(t *testing.T) {
 
 		assert.Same(t, own, resp.DERPMap, "derp_map %s", raw)
 	}
+}
+
+// The World names the space its names live in, and that is the answer the
+// head uses. See [baseDomainOf]: `dns.base_domain` is the fallback for a
+// Gentility that does not send one, not a second opinion.
+func TestRewriteUsesTheWorldsBaseDomain(t *testing.T) {
+	const rendered = "rendered.example"
+
+	self := world("1", "acme", "n1", []string{selfAddr})
+	self.BaseDomain = rendered
+	self.Names[0].Fqdn = ""
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self})
+
+	resp := &tailcfg.MapResponse{
+		Node:      worldNode(1, "100.64.0.1"),
+		DNSConfig: &tailcfg.DNSConfig{Domains: []string{"stale.example"}},
+	}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.Equal(t, []string{"acme." + rendered}, resp.DNSConfig.Domains,
+		"the search domain is composed under the World's own base domain")
+	assert.Equal(t, "n1.acme."+rendered+".", resp.Node.Name,
+		"the composed name falls back under the World's own base domain")
+}
+
+// A peer is named under ITS OWN World's base domain, not the viewer's: the
+// document that names a node is the document that says what space it is
+// named in.
+func TestRewriteNamesAPeerUnderItsOwnBaseDomain(t *testing.T) {
+	const peerDomain = "peer.example"
+
+	self := world("1", "acme", "n1", []string{selfAddr},
+		registry.Filter{Src: selfAddr + "/128", Dst: reachedAddr + "/128", Ports: []int{443}})
+
+	peerWorld := world("2", "acme", "reached", []string{reachedAddr})
+	peerWorld.BaseDomain = peerDomain
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self, "2": peerWorld})
+
+	resp := &tailcfg.MapResponse{
+		Node:  worldNode(1, "100.64.0.1"),
+		Peers: []*tailcfg.Node{worldNode(2, "100.64.0.2")},
+	}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	require.Len(t, resp.Peers, 1)
+	assert.Equal(t, "reached.acme."+peerDomain+".", resp.Peers[0].Name)
+}
+
+// A World that carries no base domain is a Gentility that does not send one
+// yet, and the head's own dns.base_domain composes the name instead.
+func TestRewriteFallsBackToTheConfiguredBaseDomain(t *testing.T) {
+	self := world("1", "acme", "n1", []string{selfAddr})
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self})
+
+	resp := &tailcfg.MapResponse{
+		Node:      worldNode(1, "100.64.0.1"),
+		DNSConfig: &tailcfg.DNSConfig{},
+	}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.Equal(t, []string{"acme." + baseDomain}, resp.DNSConfig.Domains)
+	assert.Equal(t, "n1.acme."+baseDomain+".", resp.Node.Name)
+}
+
+// The two must be equal (config-example says so), and a head that disagrees
+// with the registry composes hostnames nothing resolves. It is not fatal —
+// the World's own answer is used and the netmap is still sealed — so it is
+// reported once, at Error, rather than per map build.
+func TestRewriteReportsABaseDomainDisagreement(t *testing.T) {
+	logs := captureLogs(t)
+
+	self := world("1", "acme", "n1", []string{selfAddr})
+	self.BaseDomain = "somewhere.else"
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self})
+	mapper := newTestMapper(store)
+
+	for range 3 {
+		resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1")}
+		require.NoError(t, mapper.rewriteFromRegistry(types.NodeID(1), resp))
+	}
+
+	assert.Equal(t, 1, strings.Count(logs.String(), `"level":"error"`),
+		"the disagreement is reported once, not once per map build")
+	assert.Contains(t, logs.String(), "somewhere.else")
+	assert.Contains(t, logs.String(), baseDomain)
+}
+
+// Agreement is silence.
+func TestRewriteIsSilentWhenTheBaseDomainsAgree(t *testing.T) {
+	logs := captureLogs(t)
+
+	self := world("1", "acme", "n1", []string{selfAddr})
+	self.BaseDomain = baseDomain
+
+	store := newFakeWorlds(map[string]*registry.World{"1": self})
+
+	resp := &tailcfg.MapResponse{Node: worldNode(1, "100.64.0.1")}
+	require.NoError(t, newTestMapper(store).rewriteFromRegistry(types.NodeID(1), resp))
+
+	assert.NotContains(t, logs.String(), `"level":"error"`)
+}
+
+// captureLogs points the global zerolog logger at a buffer for one test. The
+// rewrite reports through the package-level logger, which is the only place
+// its warnings and this Error can be read from.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	previous := log.Logger
+	log.Logger = zerolog.New(&buf)
+
+	t.Cleanup(func() { log.Logger = previous })
+
+	return &buf
 }

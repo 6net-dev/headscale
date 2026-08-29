@@ -32,15 +32,16 @@ const (
 )
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
-	errRegistryBearerExclusive   = errors.New("registry.bearer and registry.bearer_path are mutually exclusive")
-	errRegistryBearerRequired    = errors.New("registry.url is set but no registry bearer was supplied")
-	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
-	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
-	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
-	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
+	errOidcMutuallyExclusive      = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errRegistryBearerExclusive    = errors.New("registry.bearer and registry.bearer_path are mutually exclusive")
+	errRegistryBearerRequired     = errors.New("registry.url is set but no registry bearer was supplied")
+	errRegistryBaseDomainRequired = errors.New("registry.url is set but dns.base_domain is empty")
+	errServerURLSuffix            = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
+	errServerURLSame              = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
+	errInvalidPKCEMethod          = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errTrustedProxyZeroRange      = errors.New("0.0.0.0/0 and ::/0 are not allowed")
+	ErrNoPrefixConfigured         = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	ErrInvalidAllocationStrategy  = errors.New("invalid prefix allocation strategy")
 )
 
 type IPAllocationStrategy string
@@ -1172,10 +1173,21 @@ const defaultRegistryCachePath = "/var/lib/headscale/registry-cache.json"
 // build closed — a control plane that starts and then serves nothing, which is
 // far harder to diagnose than one that does not start.
 //
+// A registry named with no dns.base_domain refuses to boot for the same
+// reason. The World names the space its names live in and the head serves
+// that, but the head still needs a base domain of its own: it is what the
+// search domains handed to a client are composed from when a Gentility sends
+// no base_domain, and what names a node on that same fallback. Empty, both
+// come out empty — a head that starts and then resolves nothing.
+//
+// It is passed in rather than read from viper here because dns.base_domain is
+// normalised by [dns] before anything may judge it, and re-reading the raw
+// key would be a second answer to what the base domain is.
+//
 // A bearer with no url is inert rather than wrong: nothing reads it, and
 // refusing would break a deployment that stages the secret ahead of the
-// cutover.
-func resolveRegistry() (string, string, string, error) {
+// cutover. So is a base domain with no url — that is upstream headscale.
+func resolveRegistry(baseDomain string) (string, string, string, error) {
 	bearer, err := resolveRegistryBearer()
 	if err != nil {
 		return "", "", "", err
@@ -1184,6 +1196,10 @@ func resolveRegistry() (string, string, string, error) {
 	url := viper.GetString("registry.url")
 	if url != "" && bearer == "" {
 		return "", "", "", errRegistryBearerRequired
+	}
+
+	if url != "" && baseDomain == "" {
+		return "", "", "", errRegistryBaseDomainRequired
 	}
 
 	cachePath := viper.GetString("registry.cache_path")
@@ -1287,7 +1303,7 @@ func LoadServerConfig() (*Config, error) {
 		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
-	registryURL, registryBearer, registryCachePath, err := resolveRegistry()
+	registryURL, registryBearer, registryCachePath, err := resolveRegistry(dnsConfig.BaseDomain)
 	if err != nil {
 		return nil, err
 	}

@@ -699,6 +699,16 @@ func (h *Headscale) Serve() error {
 	// to stay open. [registryRunner] carries the cursor, the persisted
 	// cache and the refresh-on-connect gate.
 	if h.cfg.RegistryURL != "" {
+		// The callbacks: a registration and a rotation are recorded
+		// before the head commits either (design §4 channels 3 and 4).
+		// A third client again, because these are short calls made from
+		// inside an open database transaction and the deadline that
+		// belongs on them is nothing like the stream's.
+		h.state.SetRegistryHook(state.NewRegistryHook(
+			registry.New(h.cfg.RegistryURL, h.cfg.RegistryBearer),
+			h.mapBatcher.SeedWorld,
+		))
+
 		runner := newRegistryRunner(
 			registry.New(h.cfg.RegistryURL, h.cfg.RegistryBearer),
 			h.mapBatcher,

@@ -65,6 +65,22 @@ func (b *Batcher) InvalidateWorld(nodeID types.NodeID) {
 	b.mapper.invalidateWorld(nodeID)
 }
 
+// SeedWorld remembers a World the head was GIVEN rather than fetched: the
+// registration callback answers with one, and it is the document that node's
+// very first map build needs.
+//
+// It is cached as current, not as unrefreshed like [Batcher.LoadWorlds]: it
+// came off this connection to Gentility a moment ago, which is exactly what a
+// refresh generation asserts about an entry. Without it the head would go
+// straight back for a document it is already holding.
+func (b *Batcher) SeedWorld(nodeID types.NodeID, world *registry.World) {
+	if b.mapper == nil || b.mapper.worldCache == nil || world == nil {
+		return
+	}
+
+	b.mapper.cacheWorld(nodeID, world)
+}
+
 // RefreshWorlds opens a new refresh generation and reads every cached World
 // again. The change-stream runner calls it on each (re)connect, before it
 // serves an event: a reconnect is the window in which the head may have missed

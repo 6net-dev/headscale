@@ -194,6 +194,12 @@ type State struct {
 	// ponytail: entries are never pruned; bounded by distinct machine keys
 	// seen, add cleanup on node delete only if it ever matters.
 	registerLocks *xsync.Map[key.MachinePublic, *sync.Mutex]
+
+	// registry is where a registration or a node key rotation is recorded
+	// before the head commits it. Nil on a head with no registry.url, and
+	// then both call sites are upstream headscale unchanged. Installed once
+	// at boot by [State.SetRegistryHook].
+	registry RegistryHook
 }
 
 // lockRegistration serialises registration for a single machine key and
@@ -1940,6 +1946,21 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 			if err != nil {
 				return nil, fmt.Errorf("using pre auth key: %w", err)
 			}
+		}
+
+		// Gentility records the registration before the head commits it
+		// (design §4 channel 3). Here and not a line earlier or later:
+		// the id it names exists only after tx.Save, and returning an
+		// error rolls the row back so the head never holds a node
+		// Gentility has not recorded — refusal and outage alike.
+		//
+		// A retry costs no id. The client's next attempt takes the
+		// re-registration branch in [State.HandleNodeFromPreAuthKey],
+		// which finds the node by machine key and allocates nothing;
+		// and Gentility's register is idempotent by content, so a
+		// repeat after a lost response records nothing twice.
+		if err := s.recordRegistration(params, nodeToRegister.ID); err != nil { //nolint:noinlineerr
+			return nil, err
 		}
 
 		return &nodeToRegister, nil

@@ -199,42 +199,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 
 	app.authProvider = authProvider
 
-	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
-		// TODO(kradalby): revisit why this takes a list.
-		var magicDNSDomains []dnsname.FQDN
-		if cfg.PrefixV4 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
-		}
-
-		if cfg.PrefixV6 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
-		}
-
-		// we might have routes already from Split DNS
-		if app.cfg.TailcfgDNSConfig.Routes == nil {
-			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
-		}
-
-		for _, d := range magicDNSDomains {
-			// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
-			// and dns.Config.Clone in tailscale drop map entries whose
-			// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
-			// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
-			// Sending nil here caused the client's wgengine LinkChange:major
-			// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
-			// — the handler reapplies a Clone of lastDNSConfig and the magic
-			// DNS routes vanish, taking the resolver with them for ~6 min
-			// until the next route-changing netmap. Empty slice survives
-			// Clone and carries the same "resolve locally" semantics
-			// (tailscale.com/ipn/ipnlocal/node_backend.go:869 documents the
-			// empty-resolver Routes form for Issue 2706).
-			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
-		}
-	}
+	addMagicDNSRoutes(cfg)
 
 	if cfg.DERP.ServerEnabled {
 		derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
@@ -270,6 +235,66 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 
 	return &app, nil
+}
+
+// addMagicDNSRoutes routes the names MagicDNS answers to the node's own
+// resolver: the reverse zones of the tailnet prefixes, and the base domain.
+//
+// The base domain is routed whole so that every name under it — another
+// organization's nodes, the platform's own records carried as ExtraRecords —
+// is asked of quad-100 rather than the OS resolver. The client derives only
+// the node's own MagicDNS suffix from its name, which leaves the rest of the
+// base domain unreached. quad-100 answers a routed name from its Hosts (peer
+// names and ExtraRecords) and NXDOMAIN for anything else, so the per-org
+// names beneath it still answer.
+func addMagicDNSRoutes(cfg *types.Config) {
+	if cfg.TailcfgDNSConfig == nil || !cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
+		return
+	}
+
+	// TODO(kradalby): revisit why this takes a list.
+	var magicDNSDomains []dnsname.FQDN
+	if cfg.PrefixV4 != nil {
+		magicDNSDomains = append(
+			magicDNSDomains,
+			util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
+	}
+
+	if cfg.PrefixV6 != nil {
+		magicDNSDomains = append(
+			magicDNSDomains,
+			util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
+	}
+
+	domains := make([]string, 0, len(magicDNSDomains)+1)
+	for _, d := range magicDNSDomains {
+		domains = append(domains, d.WithoutTrailingDot())
+	}
+
+	if cfg.BaseDomain != "" {
+		domains = append(domains, cfg.BaseDomain)
+	}
+
+	// we might have routes already from Split DNS
+	if cfg.TailcfgDNSConfig.Routes == nil {
+		cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
+	}
+
+	for _, d := range domains {
+		// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
+		// and dns.Config.Clone in tailscale drop map entries whose
+		// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
+		// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
+		// Sending nil here caused the client's wgengine LinkChange:major
+		// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
+		// — the handler reapplies a Clone of lastDNSConfig and the magic
+		// DNS routes vanish, taking the resolver with them for ~6 min
+		// until the next route-changing netmap. Empty slice survives
+		// Clone and carries the same "resolve locally" semantics
+		// (tailscale.com/ipn/ipnlocal/node_backend.go:869 documents the
+		// empty-resolver Routes form for Issue 2706).
+		cfg.TailcfgDNSConfig.Routes[d] = []*dnstype.Resolver{}
+	}
 }
 
 // Redirect to our TLS url.

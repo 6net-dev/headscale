@@ -80,8 +80,10 @@ func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("resumed removal left the live control session open")
 	}
+
 	_, ok := app.state.GetNodeByID(node.ID())
 	require.False(t, ok, "node remained registered")
+
 	_, err := app.state.DB().GetNodeByID(node.ID())
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	require.Equal(t, "11", gentility.sinces()[0])
@@ -120,6 +122,7 @@ func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
 				fmt.Fprint(w, `{"error":"unknown_node"}`)
 			}))
 			defer server.Close()
+
 			err := app.refreshRegistryNodes(t.Context(), registry.New(server.URL, "secret"))
 			_, present := app.state.GetNodeByID(node.ID())
 

@@ -12,9 +12,9 @@ name: 6net
 
 on:
   push:
-    branches: [main]
+    branches: [main, registry-v2]
   pull_request:
-    branches: [main]
+    branches: [main, registry-v2]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -63,7 +63,7 @@ jobs:
     # Only on a push. A pull request from a fork must not be handed a token
     # that can write the package registry, and a tag from a branch nobody
     # deploys is a tag nobody pins.
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
       contents: read

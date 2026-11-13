@@ -385,7 +385,8 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 	// World, and no line can arrive while it runs, so a slow refresh would
 	// otherwise trip a stream that has done nothing wrong.
 	if h.Connected != nil {
-		if err := h.Connected(); err != nil {
+		err := h.Connected()
+		if err != nil {
 			return err
 		}
 	}
@@ -462,7 +463,8 @@ func readChanges(ctx context.Context, body io.Reader, changed func(Change) error
 			data = data[:0]
 
 			if changed != nil {
-				if err := changed(change); err != nil {
+				err := changed(change)
+				if err != nil {
 					return err
 				}
 			}

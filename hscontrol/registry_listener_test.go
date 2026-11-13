@@ -90,17 +90,21 @@ func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
 
 func registeredRemovalNode(t *testing.T, app *Headscale) types.NodeView {
 	t.Helper()
+
 	user := app.state.CreateUserForTest("departing")
 	pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	require.NoError(t, err)
+
 	nodeKey := key.NewNode()
 	_, err = app.handleRegisterWithAuthKey(tailcfg.RegisterRequest{
 		Auth:    &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
 		NodeKey: nodeKey.Public(), Hostinfo: &tailcfg.Hostinfo{Hostname: "departing-node"},
 	}, key.NewMachine().Public())
 	require.NoError(t, err)
+
 	node, ok := app.state.GetNodeByNodeKey(nodeKey.Public())
 	require.True(t, ok)
+
 	return node
 }
 

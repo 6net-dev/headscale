@@ -3,6 +3,8 @@ package hscontrol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +22,126 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
+
+func TestRemovedEventDoesNotBecomeAWorldUpdate(t *testing.T) {
+	cache := newFakeWorldCache()
+	gentility := newFakeGentility(func(w http.ResponseWriter, flush func()) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"seq\":12,\"head_node_id\":\"3\",\"world_revision\":8,\"kind\":\"removed\"}\n\n")
+		flush()
+	})
+	server := serve(t, gentility)
+	runner, changes := testRunner(t, server, cache, filepath.Join(t.TempDir(), "cache.json"))
+	// Decode the exact server shape; an old reader must not be mistaken for
+	// a reader that can deregister a node simply because it accepts the JSON.
+	var event registry.Change
+	require.NoError(t, json.Unmarshal([]byte(`{"seq":12,"head_node_id":"3","world_revision":8,"kind":"removed"}`), &event))
+	run(t, runner)
+	select {
+	case change := <-changes:
+		t.Fatalf("removal was treated as an ordinary World update: %v", change)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
+	app := createTestApp(t)
+	node := registeredRemovalNode(t, app)
+	stopped := make(chan struct{})
+	var once sync.Once
+	require.NoError(t, app.mapBatcher.AddNode(node.ID(), make(chan *tailcfg.MapResponse, 16), 100,
+		func() { once.Do(func() { close(stopped) }) }))
+
+	gentility := newFakeGentility(func(w http.ResponseWriter, flush func()) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"seq\":12,\"head_node_id\":%q,\"world_revision\":8,\"kind\":\"removed\"}\n\n", registry.NodeID(node.ID().Uint64()))
+		flush()
+	})
+	server := serve(t, gentility)
+	cache := newFakeWorldCache()
+	path := filepath.Join(t.TempDir(), "cache.json")
+	cursor := int64(11)
+	require.NoError(t, saveRegistryCache(path, registryCache{Cursor: &cursor}))
+	runner, _ := testRunner(t, server, cache, path)
+	runner.remove = app.deleteRegistryNode
+	run(t, runner)
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("resumed removal left the live control session open")
+	}
+	_, ok := app.state.GetNodeByID(node.ID())
+	require.False(t, ok, "node remained registered")
+	_, err := app.state.DB().GetNodeByID(node.ID())
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.Equal(t, "11", gentility.sinces()[0])
+	require.NoError(t, app.deleteRegistryNode(node.ID()), "replayed removal must succeed")
+}
+
+func registeredRemovalNode(t *testing.T, app *Headscale) types.NodeView {
+	t.Helper()
+	user := app.state.CreateUserForTest("departing")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+	require.NoError(t, err)
+	nodeKey := key.NewNode()
+	_, err = app.handleRegisterWithAuthKey(tailcfg.RegisterRequest{
+		Auth:    &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey: nodeKey.Public(), Hostinfo: &tailcfg.Hostinfo{Hostname: "departing-node"},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+	node, ok := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, ok)
+	return node
+}
+
+func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			app := createTestApp(t)
+			node := registeredRemovalNode(t, app)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				fmt.Fprint(w, `{"error":"unknown_node"}`)
+			}))
+			defer server.Close()
+			err := app.refreshRegistryNodes(t.Context(), registry.New(server.URL, "secret"))
+			_, present := app.state.GetNodeByID(node.ID())
+			if status == http.StatusNotFound {
+				require.NoError(t, err)
+				require.False(t, present)
+			} else {
+				require.Error(t, err)
+				require.True(t, present, "a temporary failure must not deregister a node")
+			}
+		})
+	}
+}
+
+func TestRunnerRemovalFailureKeepsCursor(t *testing.T) {
+	runner := newRegistryRunner(nil, newFakeWorldCache(), nil, filepath.Join(t.TempDir(), "cache.json"))
+	cursor := int64(11)
+	runner.cursor = &cursor
+	failure := errors.New("delete failed")
+	runner.remove = func(types.NodeID) error { return failure }
+	require.ErrorIs(t, runner.apply(t.Context(), registry.Change{Kind: "removed", Seq: 12, HeadNodeID: "3", WorldRevision: 8}), failure)
+	require.Equal(t, int64(11), *runner.cursor)
+}
+
+func TestRunnerUnknownKindRefreshesBeforeAdvancing(t *testing.T) {
+	cache := newFakeWorldCache()
+	runner := newRegistryRunner(nil, cache, nil, filepath.Join(t.TempDir(), "cache.json"))
+	refreshed := false
+	runner.refreshNodes = func(context.Context) error { refreshed = true; return nil }
+	require.NoError(t, runner.apply(t.Context(), registry.Change{Kind: "future-kind", Seq: 12, HeadNodeID: "future-shape", WorldRevision: 8}))
+	require.True(t, refreshed)
+	require.Equal(t, []string{"refresh"}, cache.taken())
+	require.Equal(t, int64(12), *runner.cursor)
+}
 
 // fakeWorldCache records what the runner did to the head's World cache and in
 // what order, since the order is the contract: every cached World is refreshed

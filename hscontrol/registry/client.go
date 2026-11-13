@@ -300,8 +300,8 @@ func (c *Client) Rotate(ctx context.Context, rot Rotation) error {
 // needs a lock of its own and neither may block for long: a slow handler is
 // backpressure on the stream.
 type ChangeHandler struct {
-	Connected func()
-	Changed   func(Change)
+	Connected func() error
+	Changed   func(Change) error
 }
 
 // Changes follows the change stream from a cursor until the context is
@@ -385,7 +385,9 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 	// World, and no line can arrive while it runs, so a slow refresh would
 	// otherwise trip a stream that has done nothing wrong.
 	if h.Connected != nil {
-		h.Connected()
+		if err := h.Connected(); err != nil {
+			return err
+		}
 	}
 
 	var idle atomic.Bool
@@ -417,7 +419,7 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 // and so is "id" — the cursor the head persists is the seq inside the payload,
 // and an id line that disagreed with it would be a second answer to what the
 // cursor is.
-func readChanges(ctx context.Context, body io.Reader, changed func(Change), alive func()) error {
+func readChanges(ctx context.Context, body io.Reader, changed func(Change) error, alive func()) error {
 	reader := newLineReader(body)
 
 	var data []string
@@ -460,7 +462,9 @@ func readChanges(ctx context.Context, body io.Reader, changed func(Change), aliv
 			data = data[:0]
 
 			if changed != nil {
-				changed(change)
+				if err := changed(change); err != nil {
+					return err
+				}
 			}
 		case strings.HasPrefix(line, ":"):
 			// A comment. ": keepalive" is the only one Gentility sends.

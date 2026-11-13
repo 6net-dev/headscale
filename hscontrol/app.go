@@ -740,6 +740,11 @@ func (h *Headscale) Serve() error {
 			h.Change,
 			h.cfg.RegistryCachePath,
 		)
+		runner.remove = h.deleteRegistryNode
+		refreshClient := registry.New(h.cfg.RegistryURL, h.cfg.RegistryBearer)
+		runner.refreshNodes = func(ctx context.Context) error {
+			return h.refreshRegistryNodes(ctx, refreshClient)
+		}
 
 		// Synchronously, before the goroutine and before the listeners
 		// below: the disk cache is what a head booting into an

@@ -320,11 +320,11 @@ func (api headscaleV1APIServer) SetTags(
 	// Validate tags not empty - tagged nodes must have at least one tag
 	if len(request.GetTags()) == 0 {
 		return &v1.SetTagsResponse{
-				Node: nil,
-			}, status.Error(
-				codes.InvalidArgument,
-				"cannot remove all tags from a node - tagged nodes must have at least one tag",
-			)
+			Node: nil,
+		}, status.Error(
+			codes.InvalidArgument,
+			"cannot remove all tags from a node - tagged nodes must have at least one tag",
+		)
 	}
 
 	// Validate tag format
@@ -433,17 +433,9 @@ func (api headscaleV1APIServer) DeleteNode(
 	ctx context.Context,
 	request *v1.DeleteNodeRequest,
 ) (*v1.DeleteNodeResponse, error) {
-	node, ok := api.h.state.GetNodeByID(types.NodeID(request.GetNodeId()))
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "node not found")
-	}
-
-	nodeChange, err := api.h.state.DeleteNode(node)
-	if err != nil {
+	if err := api.h.deleteRegistryNode(types.NodeID(request.GetNodeId())); err != nil {
 		return nil, err
 	}
-
-	api.h.Change(nodeChange)
 
 	return &v1.DeleteNodeResponse{}, nil
 }

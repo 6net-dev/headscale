@@ -3,6 +3,7 @@ package hscontrol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"time"
@@ -101,10 +102,12 @@ type changeStream interface {
 // design §4 makes and measures rather than a gap. It survives a restart
 // because the cache is on disk.
 type registryRunner struct {
-	stream changeStream
-	worlds worldCache
-	change func(...change.Change)
-	path   string
+	stream       changeStream
+	worlds       worldCache
+	change       func(...change.Change)
+	path         string
+	remove       func(types.NodeID) error
+	refreshNodes func(context.Context) error
 
 	// backoff and backoffMax bound the reconnect wait; saveEvery throttles
 	// the cache file. Fields rather than constants so a test can wind them
@@ -163,10 +166,12 @@ func (r *registryRunner) run(ctx context.Context) {
 		connected := false
 
 		err := r.stream.Changes(ctx, r.cursor, registry.ChangeHandler{
-			Connected: func() {
+			Connected: func() error {
 				connected = true
 
-				r.worlds.RefreshWorlds(ctx)
+				if err := r.refresh(ctx); err != nil {
+					return err
+				}
 
 				// The refresh just made every cached World
 				// current, so the disk copy is owed one write
@@ -174,8 +179,9 @@ func (r *registryRunner) run(ctx context.Context) {
 				// event ever moves the cursor.
 				r.dirty = true
 				r.save()
+				return nil
 			},
-			Changed: r.apply,
+			Changed: func(c registry.Change) error { return r.apply(ctx, c) },
 		})
 
 		// Whatever ended the stream, the cursor the throttle was
@@ -216,32 +222,91 @@ func (r *registryRunner) run(ctx context.Context) {
 	}
 }
 
-// apply is one event: forget that node's World, wake that node, advance the
-// cursor.
-//
-// The cursor advances even for an event the head cannot attribute to a node.
-// The alternative is a head that re-reads the same unattributable event on
-// every reconnect for the rest of the installation's life; the news is lost
-// either way, and the next refresh is what recovers it.
-func (r *registryRunner) apply(c registry.Change) {
-	r.cursor = &c.Seq
-	r.dirty = true
-
+// apply advances the cursor only after the event's effect succeeds. Unknown
+// kinds require a full refresh; malformed known events and failed removals
+// retain the cursor so reconnect cannot silently lose a revocation.
+func (r *registryRunner) apply(ctx context.Context, c registry.Change) error {
+	if c.Kind != "" && c.Kind != "world" && c.Kind != "removed" {
+		if err := r.refresh(ctx); err != nil {
+			return err
+		}
+		r.cursor = &c.Seq
+		r.dirty = true
+		r.save()
+		return nil
+	}
 	nodeID, err := strconv.ParseUint(c.HeadNodeID, 10, 64)
 	if err != nil {
-		log.Warn().
-			Str("head.node.id", c.HeadNodeID).
-			Int64("seq", c.Seq).
-			Msg("registry change named something that is not a head node id")
-
-		r.save()
-
-		return
+		return fmt.Errorf("registry change %d has an invalid head node id: %w", c.Seq, err)
 	}
 
-	r.worlds.InvalidateWorld(types.NodeID(nodeID))
-	r.change(change.FullSelf(types.NodeID(nodeID)))
+	switch c.Kind {
+	case "", "world":
+		r.worlds.InvalidateWorld(types.NodeID(nodeID))
+		r.change(change.FullSelf(types.NodeID(nodeID)))
+	case "removed":
+		if r.remove == nil {
+			return errors.New("registry removal handler is not configured")
+		}
+		if err := r.remove(types.NodeID(nodeID)); err != nil {
+			return err
+		}
+	}
+	r.cursor = &c.Seq
+	r.dirty = true
 	r.save()
+	return nil
+}
+
+func (r *registryRunner) refresh(ctx context.Context) error {
+	if r.refreshNodes != nil {
+		if err := r.refreshNodes(ctx); err != nil {
+			return err
+		}
+	}
+	r.worlds.RefreshWorlds(ctx)
+	return nil
+}
+
+// deleteRegistryNode is shared by the DELETE API and durable feed. Removing
+// cached state and notifying the batcher happen only after durable deletion.
+func (h *Headscale) deleteRegistryNode(id types.NodeID) error {
+	if node, ok := h.state.GetNodeByID(id); ok {
+		removed, err := h.state.DeleteNode(node)
+		if err != nil {
+			return err
+		}
+		h.mapBatcher.InvalidateWorld(id)
+		h.Change(removed)
+	} else {
+		h.mapBatcher.InvalidateWorld(id)
+		h.Change(change.NodeRemoved(id))
+	}
+	return nil
+}
+
+// Refresh registered identities as well as cached Worlds. A cursor below the
+// compaction floor may have missed removal while the node had no cached World.
+func (h *Headscale) refreshRegistryNodes(ctx context.Context, client *registry.Client) error {
+	limit := h.cfg.RegistryRefreshTimeout
+	if limit <= 0 {
+		limit = types.DefaultRegistryRefreshTimeout
+	}
+	ctx, cancelSweep := context.WithTimeout(ctx, limit)
+	defer cancelSweep()
+	for _, node := range h.state.ListNodes().All() {
+		readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err := client.World(readCtx, registry.NodeID(node.ID().Uint64()))
+		cancel()
+		if errors.Is(err, registry.ErrUnknownNode) {
+			if err := h.deleteRegistryNode(node.ID()); err != nil {
+				return err
+			}
+		} else if err != nil && !errors.Is(err, registry.ErrNotRendered) {
+			return err
+		}
+	}
+	return nil
 }
 
 // behindHorizon clears a cursor below what Gentility still holds: the events it

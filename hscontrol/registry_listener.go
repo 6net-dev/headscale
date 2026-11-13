@@ -14,6 +14,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var errRegistryRemovalUnconfigured = errors.New("registry removal handler is not configured")
+
 const (
 	// registryReconnectDelay is the first wait after a stream ends, and the
 	// unit the backoff doubles.
@@ -169,8 +171,9 @@ func (r *registryRunner) run(ctx context.Context) {
 			Connected: func() error {
 				connected = true
 
-				if err := r.refresh(ctx); err != nil {
-					return err
+				refreshErr := r.refresh(ctx)
+				if refreshErr != nil {
+					return refreshErr
 				}
 
 				// The refresh just made every cached World
@@ -179,6 +182,7 @@ func (r *registryRunner) run(ctx context.Context) {
 				// event ever moves the cursor.
 				r.dirty = true
 				r.save()
+
 				return nil
 			},
 			Changed: func(c registry.Change) error { return r.apply(ctx, c) },
@@ -227,12 +231,15 @@ func (r *registryRunner) run(ctx context.Context) {
 // retain the cursor so reconnect cannot silently lose a revocation.
 func (r *registryRunner) apply(ctx context.Context, c registry.Change) error {
 	if c.Kind != "" && c.Kind != "world" && c.Kind != "removed" {
-		if err := r.refresh(ctx); err != nil {
+		err := r.refresh(ctx)
+		if err != nil {
 			return err
 		}
+
 		r.cursor = &c.Seq
 		r.dirty = true
 		r.save()
+
 		return nil
 	}
 	nodeID, err := strconv.ParseUint(c.HeadNodeID, 10, 64)
@@ -246,25 +253,32 @@ func (r *registryRunner) apply(ctx context.Context, c registry.Change) error {
 		r.change(change.FullSelf(types.NodeID(nodeID)))
 	case "removed":
 		if r.remove == nil {
-			return errors.New("registry removal handler is not configured")
+			return errRegistryRemovalUnconfigured
 		}
-		if err := r.remove(types.NodeID(nodeID)); err != nil {
+
+		err := r.remove(types.NodeID(nodeID))
+		if err != nil {
 			return err
 		}
 	}
+
 	r.cursor = &c.Seq
 	r.dirty = true
 	r.save()
+
 	return nil
 }
 
 func (r *registryRunner) refresh(ctx context.Context) error {
 	if r.refreshNodes != nil {
-		if err := r.refreshNodes(ctx); err != nil {
+		err := r.refreshNodes(ctx)
+		if err != nil {
 			return err
 		}
 	}
+
 	r.worlds.RefreshWorlds(ctx)
+
 	return nil
 }
 
@@ -276,12 +290,14 @@ func (h *Headscale) deleteRegistryNode(id types.NodeID) error {
 		if err != nil {
 			return err
 		}
+
 		h.mapBatcher.InvalidateWorld(id)
 		h.Change(removed)
 	} else {
 		h.mapBatcher.InvalidateWorld(id)
 		h.Change(change.NodeRemoved(id))
 	}
+
 	return nil
 }
 
@@ -292,20 +308,26 @@ func (h *Headscale) refreshRegistryNodes(ctx context.Context, client *registry.C
 	if limit <= 0 {
 		limit = types.DefaultRegistryRefreshTimeout
 	}
+
 	ctx, cancelSweep := context.WithTimeout(ctx, limit)
 	defer cancelSweep()
+
 	for _, node := range h.state.ListNodes().All() {
 		readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		_, err := client.World(readCtx, registry.NodeID(node.ID().Uint64()))
+
 		cancel()
+
 		if errors.Is(err, registry.ErrUnknownNode) {
-			if err := h.deleteRegistryNode(node.ID()); err != nil {
+			err := h.deleteRegistryNode(node.ID())
+			if err != nil {
 				return err
 			}
 		} else if err != nil && !errors.Is(err, registry.ErrNotRendered) {
 			return err
 		}
 	}
+
 	return nil
 }
 

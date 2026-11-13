@@ -614,6 +614,7 @@ func (s *State) DeleteNode(node types.NodeView) (change.Change, error) {
 	if err != nil {
 		return change.Change{}, err
 	}
+
 	s.nodeStore.DeleteNode(node.ID())
 
 	s.ipAlloc.FreeIPs(node.IPs())

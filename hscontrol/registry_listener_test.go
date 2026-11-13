@@ -27,6 +27,8 @@ import (
 	"tailscale.com/types/key"
 )
 
+var errTestRegistryDelete = errors.New("delete failed")
+
 func TestRemovedEventDoesNotBecomeAWorldUpdate(t *testing.T) {
 	cache := newFakeWorldCache()
 	gentility := newFakeGentility(func(w http.ResponseWriter, flush func()) {
@@ -41,6 +43,7 @@ func TestRemovedEventDoesNotBecomeAWorldUpdate(t *testing.T) {
 	var event registry.Change
 	require.NoError(t, json.Unmarshal([]byte(`{"seq":12,"head_node_id":"3","world_revision":8,"kind":"removed"}`), &event))
 	run(t, runner)
+
 	select {
 	case change := <-changes:
 		t.Fatalf("removal was treated as an ordinary World update: %v", change)
@@ -52,7 +55,9 @@ func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
 	app := createTestApp(t)
 	node := registeredRemovalNode(t, app)
 	stopped := make(chan struct{})
+
 	var once sync.Once
+
 	require.NoError(t, app.mapBatcher.AddNode(node.ID(), make(chan *tailcfg.MapResponse, 16), 100,
 		func() { once.Do(func() { close(stopped) }) }))
 
@@ -69,6 +74,7 @@ func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
 	runner, _ := testRunner(t, server, cache, path)
 	runner.remove = app.deleteRegistryNode
 	run(t, runner)
+
 	select {
 	case <-stopped:
 	case <-time.After(3 * time.Second):
@@ -103,6 +109,7 @@ func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			app := createTestApp(t)
 			node := registeredRemovalNode(t, app)
+
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(status)
@@ -111,6 +118,7 @@ func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
 			defer server.Close()
 			err := app.refreshRegistryNodes(t.Context(), registry.New(server.URL, "secret"))
 			_, present := app.state.GetNodeByID(node.ID())
+
 			if status == http.StatusNotFound {
 				require.NoError(t, err)
 				require.False(t, present)
@@ -126,7 +134,7 @@ func TestRunnerRemovalFailureKeepsCursor(t *testing.T) {
 	runner := newRegistryRunner(nil, newFakeWorldCache(), nil, filepath.Join(t.TempDir(), "cache.json"))
 	cursor := int64(11)
 	runner.cursor = &cursor
-	failure := errors.New("delete failed")
+	failure := errTestRegistryDelete
 	runner.remove = func(types.NodeID) error { return failure }
 	require.ErrorIs(t, runner.apply(t.Context(), registry.Change{Kind: "removed", Seq: 12, HeadNodeID: "3", WorldRevision: 8}), failure)
 	require.Equal(t, int64(11), *runner.cursor)

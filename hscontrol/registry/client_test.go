@@ -21,9 +21,10 @@ func TestChangePreservesRemovalAndUnknownKinds(t *testing.T) {
 	for _, kind := range []string{"world", "removed", "future-kind"} {
 		t.Run(kind, func(t *testing.T) {
 			var event Change
-			require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(`{"seq":12,"head_node_id":"3","world_revision":8,"kind":%q}`, kind)), &event))
+			require.NoError(t, json.Unmarshal(fmt.Appendf(nil, `{"seq":12,"head_node_id":"3","world_revision":8,"kind":%q}`, kind), &event))
 			encoded, err := json.Marshal(event)
 			require.NoError(t, err)
+
 			var fields map[string]any
 			require.NoError(t, json.Unmarshal(encoded, &fields))
 			require.Equal(t, kind, fields["kind"], "the reader must retain kind so removal or full refresh can be chosen")

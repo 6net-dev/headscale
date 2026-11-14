@@ -17,6 +17,50 @@ import (
 
 const testBearer = "overlay-head-shared-secret-marker" //nolint:gosec // test marker, not a real credential
 
+func TestWorldDistinguishesExplicitRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		removed bool
+	}{
+		{"removed", `{"error":"removed"}`, true},
+		{"unknown", `{"error":"unknown_node"}`, false},
+		{"html", `<html>Not found</html>`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, tc.body)
+			})
+
+			_, err := client.World(t.Context(), "3")
+			require.Error(t, err)
+
+			if tc.removed {
+				require.NotErrorIs(t, err, ErrUnknownNode)
+				require.EqualError(t, err, "registry: removed node")
+			} else {
+				require.ErrorIs(t, err, ErrUnknownNode)
+			}
+		})
+	}
+}
+
+func TestChangePreservesRemovalAndUnknownKinds(t *testing.T) {
+	for _, kind := range []string{"world", "removed", "future-kind"} {
+		t.Run(kind, func(t *testing.T) {
+			var event Change
+			require.NoError(t, json.Unmarshal(fmt.Appendf(nil, `{"seq":12,"head_node_id":"3","world_revision":8,"kind":%q}`, kind), &event))
+			encoded, err := json.Marshal(event)
+			require.NoError(t, err)
+
+			var fields map[string]any
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			require.Equal(t, kind, fields["kind"], "the reader must retain kind so removal or full refresh can be chosen")
+		})
+	}
+}
+
 // worldV1 is master §2.4's example document, verbatim. It is the fixture
 // rather than a hand-rolled map because the point of this test is that the
 // document Gentility renders decodes here without amendment.
@@ -259,8 +303,8 @@ func TestChangesReadsGentilitysFraming(t *testing.T) {
 	)
 
 	err := client.Changes(t.Context(), cursor(40), ChangeHandler{
-		Connected: func() { connected++ },
-		Changed:   func(c Change) { got = append(got, c) },
+		Connected: func() error { connected++; return nil },
+		Changed:   func(c Change) error { got = append(got, c); return nil },
 	})
 	require.NoError(t, err, "a clean end of stream is how a long poll ends")
 
@@ -285,7 +329,7 @@ func TestChangesJoinsMultiLineData(t *testing.T) {
 	var got []Change
 
 	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
-		Changed: func(c Change) { got = append(got, c) },
+		Changed: func(c Change) error { got = append(got, c); return nil },
 	}))
 	assert.Equal(t, []Change{{Seq: 9, HeadNodeID: "3", WorldRevision: 4}}, got)
 }
@@ -302,7 +346,7 @@ func TestChangesAcceptsCRLFAndBareCR(t *testing.T) {
 	var got []Change
 
 	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
-		Changed: func(c Change) { got = append(got, c) },
+		Changed: func(c Change) error { got = append(got, c); return nil },
 	}))
 	assert.Equal(t, []Change{
 		{Seq: 1, HeadNodeID: "3", WorldRevision: 1},
@@ -317,7 +361,7 @@ func TestChangesIgnoresKeepalivesAndUnknownFields(t *testing.T) {
 	})
 
 	require.NoError(t, client.Changes(t.Context(), cursor(0), ChangeHandler{
-		Changed: func(Change) { t.Error("no event was sent") },
+		Changed: func(Change) error { t.Error("no event was sent"); return nil },
 	}))
 }
 
@@ -328,7 +372,7 @@ func TestChangesBehindHorizonCarriesTheHorizon(t *testing.T) {
 	})
 
 	err := client.Changes(t.Context(), cursor(1), ChangeHandler{
-		Connected: func() { t.Error("a refused stream was never connected") },
+		Connected: func() error { t.Error("a refused stream was never connected"); return nil },
 	})
 
 	require.ErrorIs(t, err, ErrBehindHorizon)
@@ -424,8 +468,8 @@ func TestChangesOmitsSinceWithoutACursor(t *testing.T) {
 	)
 
 	require.NoError(t, client.Changes(t.Context(), nil, ChangeHandler{
-		Connected: func() { connected++ },
-		Changed:   func(c Change) { got = append(got, c) },
+		Connected: func() error { connected++; return nil },
+		Changed:   func(c Change) error { got = append(got, c); return nil },
 	}))
 
 	assert.Empty(t, gotQuery, "no cursor is an absent since, not since=0")
@@ -495,7 +539,7 @@ func TestChangesGivesUpOnAStreamThatFallsSilent(t *testing.T) {
 	var got []Change
 
 	err := client.Changes(t.Context(), nil, ChangeHandler{
-		Changed: func(c Change) { got = append(got, c) },
+		Changed: func(c Change) error { got = append(got, c); return nil },
 	})
 
 	require.ErrorIs(t, err, ErrStreamIdle)

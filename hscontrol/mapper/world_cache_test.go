@@ -316,8 +316,8 @@ func TestRefreshWorldsDoesNotHoldTheChangeStream(t *testing.T) {
 	// Ten seconds of Worlds, one connection, one event waiting behind them.
 	started := time.Now()
 	err := client.Changes(t.Context(), nil, registry.ChangeHandler{
-		Connected: func() { m.refreshWorlds(t.Context()) },
-		Changed:   func(c registry.Change) { delivered = append(delivered, c) },
+		Connected: func() error { m.refreshWorlds(t.Context()); return nil },
+		Changed:   func(c registry.Change) error { delivered = append(delivered, c); return nil },
 	})
 	require.NoError(t, err)
 

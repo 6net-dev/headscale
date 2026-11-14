@@ -610,12 +610,12 @@ func (s *State) SaveNode(node types.NodeView) (types.NodeView, change.Change, er
 // DeleteNode permanently removes a node and cleans up associated resources.
 // Returns whether policies changed and any error. This operation is irreversible.
 func (s *State) DeleteNode(node types.NodeView) (change.Change, error) {
-	s.nodeStore.DeleteNode(node.ID())
-
 	err := s.db.DeleteNode(node.AsStruct())
 	if err != nil {
 		return change.Change{}, err
 	}
+
+	s.nodeStore.DeleteNode(node.ID())
 
 	s.ipAlloc.FreeIPs(node.IPs())
 

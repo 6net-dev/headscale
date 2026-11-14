@@ -113,6 +113,7 @@ type Filter struct {
 // payload here would be a second, unordered copy of a stream whose only value
 // is that it is ordered.
 type Change struct {
+	Kind          string `json:"kind,omitempty"`
 	Seq           int64  `json:"seq"`
 	HeadNodeID    string `json:"head_node_id"`
 	WorldRevision int64  `json:"world_revision"`

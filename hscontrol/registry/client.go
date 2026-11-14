@@ -83,10 +83,11 @@ var (
 	// ErrRateLimited: 429.
 	ErrRateLimited = errors.New("registry: too many calls")
 
-	// ErrUnknownNode: 404 on world and rotate. Gentility has never heard of
-	// this head node id, or has forgotten it — a revoked node is refused as
-	// unknown rather than served the last World it held.
+	// ErrUnknownNode: an unrecognized 404 on world or rotate. Not removal authority.
 	ErrUnknownNode = errors.New("registry: unknown node")
+
+	// ErrRemoved: a world 404 explicitly identifies a revoked node.
+	ErrRemoved = errors.New("registry: removed node")
 
 	// ErrUnknownKey: 404 on register. No such pre-auth key here.
 	ErrUnknownKey = errors.New("registry: unknown pre-auth key")
@@ -224,6 +225,15 @@ func (c *Client) World(ctx context.Context, headNodeID string) (*World, error) {
 
 		return &world, nil
 	case http.StatusNotFound:
+		var refusal struct {
+			Error string `json:"error"`
+		}
+
+		err := decodeDocument(resp, &refusal)
+		if err == nil && refusal.Error == "removed" {
+			return nil, ErrRemoved
+		}
+
 		return nil, ErrUnknownNode
 	case http.StatusConflict:
 		return nil, ErrNotRendered
@@ -289,19 +299,17 @@ func (c *Client) Rotate(ctx context.Context, rot Rotation) error {
 
 // ChangeHandler is what a caller does with the stream.
 //
-// Connected is called once each time the stream opens, BEFORE any event —
-// that is the head's cue to refresh every World it has cached, since a
-// reconnect is exactly the window in which it may have missed one. It is what
-// makes a nil cursor safe: the refresh, not the backlog, is how a head with
-// no cursor catches up.
+// Connected is called once each time the stream opens, BEFORE any event.
+// The caller attempts an owed recovery sweep here; ordinary cursor resumes
+// need no sweep. A partial sweep must not prevent event delivery.
 // Changed is called for each event, in seq order.
 //
 // Both are called on the goroutine that called [Client.Changes], so neither
 // needs a lock of its own and neither may block for long: a slow handler is
 // backpressure on the stream.
 type ChangeHandler struct {
-	Connected func()
-	Changed   func(Change)
+	Connected func() error
+	Changed   func(Change) error
 }
 
 // Changes follows the change stream from a cursor until the context is
@@ -385,7 +393,10 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 	// World, and no line can arrive while it runs, so a slow refresh would
 	// otherwise trip a stream that has done nothing wrong.
 	if h.Connected != nil {
-		h.Connected()
+		err := h.Connected()
+		if err != nil {
+			return err
+		}
 	}
 
 	var idle atomic.Bool
@@ -417,7 +428,7 @@ func (c *Client) Changes(ctx context.Context, since *int64, h ChangeHandler) err
 // and so is "id" — the cursor the head persists is the seq inside the payload,
 // and an id line that disagreed with it would be a second answer to what the
 // cursor is.
-func readChanges(ctx context.Context, body io.Reader, changed func(Change), alive func()) error {
+func readChanges(ctx context.Context, body io.Reader, changed func(Change) error, alive func()) error {
 	reader := newLineReader(body)
 
 	var data []string
@@ -460,7 +471,10 @@ func readChanges(ctx context.Context, body io.Reader, changed func(Change), aliv
 			data = data[:0]
 
 			if changed != nil {
-				changed(change)
+				err := changed(change)
+				if err != nil {
+					return err
+				}
 			}
 		case strings.HasPrefix(line, ":"):
 			// A comment. ": keepalive" is the only one Gentility sends.

@@ -17,6 +17,35 @@ import (
 
 const testBearer = "overlay-head-shared-secret-marker" //nolint:gosec // test marker, not a real credential
 
+func TestWorldDistinguishesExplicitRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		removed bool
+	}{
+		{"removed", `{"error":"removed"}`, true},
+		{"unknown", `{"error":"unknown_node"}`, false},
+		{"html", `<html>Not found</html>`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, tc.body)
+			})
+
+			_, err := client.World(t.Context(), "3")
+			require.Error(t, err)
+
+			if tc.removed {
+				require.NotErrorIs(t, err, ErrUnknownNode)
+				require.EqualError(t, err, "registry: removed node")
+			} else {
+				require.ErrorIs(t, err, ErrUnknownNode)
+			}
+		})
+	}
+}
+
 func TestChangePreservesRemovalAndUnknownKinds(t *testing.T) {
 	for _, kind := range []string{"world", "removed", "future-kind"} {
 		t.Run(kind, func(t *testing.T) {

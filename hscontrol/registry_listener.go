@@ -3,7 +3,6 @@ package hscontrol
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"time"
@@ -90,11 +89,9 @@ type changeStream interface {
 //
 // # What a reconnect means
 //
-// Every (re)connect refreshes every cached World before an event is served,
-// because a reconnect is exactly the window in which the head may have missed
-// one and no gap in the stream may leave a stale netmap. That refresh is the
-// ready gate; [mapper.beginWorldRefresh] documents what it does and does not
-// promise.
+// A valid cursor resumes the feed without a sweep. A cold start, horizon gap,
+// or unusable event records a sweep obligation. Reconnect attempts that sweep,
+// keeping unresolved nodes and the obligation without blocking event delivery.
 //
 // # What being cut off means
 //
@@ -122,7 +119,8 @@ type registryRunner struct {
 	// field below here is touched only from run's own goroutine —
 	// [registry.ChangeHandler] promises both callbacks are made on the
 	// goroutine that called Changes — so none of them is locked.
-	cursor *int64
+	cursor    *int64
+	sweepOwed bool
 
 	// dirty is a cursor the throttle has not written yet; savedAt is when
 	// the file was last written.
@@ -171,21 +169,26 @@ func (r *registryRunner) run(ctx context.Context) {
 			Connected: func() error {
 				connected = true
 
-				refreshErr := r.refresh(ctx)
-				if refreshErr != nil {
-					return refreshErr
+				if r.cursor == nil {
+					r.sweepOwed = true
 				}
 
-				// The refresh just made every cached World
-				// current, so the disk copy is owed one write
-				// even on an installation quiet enough that no
-				// event ever moves the cursor.
+				if r.sweepOwed {
+					refreshErr := r.refresh(ctx)
+					if refreshErr != nil {
+						log.Warn().Err(refreshErr).Msg("registry sweep incomplete; retry owed on reconnect")
+					} else {
+						r.sweepOwed = false
+					}
+				}
+
+				// Persist recovery state even when no event moves the cursor.
 				r.dirty = true
 				r.save()
 
 				return nil
 			},
-			Changed: func(c registry.Change) error { return r.apply(ctx, c) },
+			Changed: r.apply,
 		})
 
 		// Whatever ended the stream, the cursor the throttle was
@@ -226,25 +229,19 @@ func (r *registryRunner) run(ctx context.Context) {
 	}
 }
 
-// apply advances the cursor only after the event's effect succeeds. Unknown
-// kinds require a full refresh; malformed known events and failed removals
-// retain the cursor so reconnect cannot silently lose a revocation.
-func (r *registryRunner) apply(ctx context.Context, c registry.Change) error {
+// apply advances after applying the event or recording a sweep obligation for
+// an unusable event. A failed explicit removal retains its cursor for replay.
+func (r *registryRunner) apply(c registry.Change) error {
 	if c.Kind != "" && c.Kind != "world" && c.Kind != "removed" {
-		err := r.refresh(ctx)
-		if err != nil {
-			return err
-		}
-
-		r.cursor = &c.Seq
-		r.dirty = true
-		r.save()
-
+		r.deferSweep(c.Seq)
 		return nil
 	}
 	nodeID, err := strconv.ParseUint(c.HeadNodeID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("registry change %d has an invalid head node id: %w", c.Seq, err)
+		log.Warn().Err(err).Int64("seq", c.Seq).Msg("registry event has invalid node id; sweep owed")
+		r.deferSweep(c.Seq)
+
+		return nil
 	}
 
 	switch c.Kind {
@@ -269,17 +266,22 @@ func (r *registryRunner) apply(ctx context.Context, c registry.Change) error {
 	return nil
 }
 
+func (r *registryRunner) deferSweep(seq int64) {
+	r.sweepOwed = true
+	r.cursor = &seq
+	r.dirty = true
+	r.save()
+}
+
 func (r *registryRunner) refresh(ctx context.Context) error {
+	var sweepErr error
 	if r.refreshNodes != nil {
-		err := r.refreshNodes(ctx)
-		if err != nil {
-			return err
-		}
+		sweepErr = r.refreshNodes(ctx)
 	}
 
 	r.worlds.RefreshWorlds(ctx)
 
-	return nil
+	return sweepErr
 }
 
 // deleteRegistryNode is shared by the DELETE API and durable feed. Removing
@@ -312,23 +314,25 @@ func (h *Headscale) refreshRegistryNodes(ctx context.Context, client *registry.C
 	ctx, cancelSweep := context.WithTimeout(ctx, limit)
 	defer cancelSweep()
 
+	var failures error
+
 	for _, node := range h.state.ListNodes().All() {
 		readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		_, err := client.World(readCtx, registry.NodeID(node.ID().Uint64()))
 
 		cancel()
 
-		if errors.Is(err, registry.ErrUnknownNode) {
-			err := h.deleteRegistryNode(node.ID())
-			if err != nil {
-				return err
-			}
-		} else if err != nil && !errors.Is(err, registry.ErrNotRendered) {
-			return err
+		if errors.Is(err, registry.ErrRemoved) {
+			err = h.deleteRegistryNode(node.ID())
+		}
+
+		if err != nil && !errors.Is(err, registry.ErrNotRendered) {
+			log.Warn().Err(err).Uint64("node.id", node.ID().Uint64()).Msg("registry sweep could not reconcile node; retained for retry")
+			failures = errors.Join(failures, err)
 		}
 	}
 
-	return nil
+	return failures
 }
 
 // behindHorizon clears a cursor below what Gentility still holds: the events it
@@ -358,6 +362,7 @@ func (r *registryRunner) behindHorizon(err error) bool {
 		Msg("registry cursor fell behind the compaction horizon; asking for the tail")
 
 	r.cursor = nil
+	r.sweepOwed = true
 	r.dirty = true
 	r.save()
 
@@ -388,6 +393,7 @@ func (r *registryRunner) restore() {
 	}
 
 	r.cursor = cache.Cursor
+	r.sweepOwed = cache.SweepOwed || cache.Cursor == nil
 	r.worlds.LoadWorlds(cache.worldsByNodeID())
 }
 
@@ -397,7 +403,11 @@ func (r *registryRunner) save() {
 		return
 	}
 
-	if err := saveRegistryCache(r.path, registryCacheOf(r.worlds.SnapshotWorlds(), r.cursor)); err != nil {
+	cache := registryCacheOf(r.worlds.SnapshotWorlds(), r.cursor)
+	cache.SweepOwed = r.sweepOwed
+
+	err := saveRegistryCache(r.path, cache)
+	if err != nil {
 		// Not fatal, and not retried here: the next event tries again,
 		// and a head that never manages to write one is a head that
 		// full-refreshes on its next boot.

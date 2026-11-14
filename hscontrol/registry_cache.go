@@ -32,7 +32,8 @@ type registryCache struct {
 	// never followed the stream. The two are different requests — nil asks
 	// for the tail, zero replays from the beginning — which is why this is
 	// a pointer and why the JSON has to be able to say null.
-	Cursor *int64 `json:"cursor"`
+	Cursor    *int64 `json:"cursor"`
+	SweepOwed bool   `json:"sweep_owed"`
 
 	// Worlds is keyed by head node id in the decimal form this channel
 	// names a node by ([registry.NodeID]), because a JSON object's keys

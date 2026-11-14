@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -93,7 +94,12 @@ func TestRunnerResumesRemovalAndClosesRegisteredNode(t *testing.T) {
 func registeredRemovalNode(t *testing.T, app *Headscale) types.NodeView {
 	t.Helper()
 
-	user := app.state.CreateUserForTest("departing")
+	count := 0
+	for range app.state.ListNodes().All() {
+		count++
+	}
+
+	user := app.state.CreateUserForTest(fmt.Sprintf("departing-%d", count))
 	pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	require.NoError(t, err)
 
@@ -110,23 +116,33 @@ func registeredRemovalNode(t *testing.T, app *Headscale) types.NodeView {
 	return node
 }
 
-func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
-	for _, status := range []int{http.StatusNotFound, http.StatusServiceUnavailable} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+func TestRegistryRefreshRemovesOnlyExplicitlyRemovedNodes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		removed bool
+	}{
+		{"removed", http.StatusNotFound, `{"error":"removed"}`, true},
+		{"unknown", http.StatusNotFound, `{"error":"unknown_node"}`, false},
+		{"html", http.StatusNotFound, `<html>Not found</html>`, false},
+		{"unavailable", http.StatusServiceUnavailable, `{"error":"unavailable"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			app := createTestApp(t)
 			node := registeredRemovalNode(t, app)
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				fmt.Fprint(w, `{"error":"unknown_node"}`)
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
 			}))
 			defer server.Close()
 
 			err := app.refreshRegistryNodes(t.Context(), registry.New(server.URL, "secret"))
 			_, present := app.state.GetNodeByID(node.ID())
 
-			if status == http.StatusNotFound {
+			if tc.removed {
 				require.NoError(t, err)
 				require.False(t, present)
 			} else {
@@ -137,25 +153,82 @@ func TestRegistryRefreshRemovesOnlyAuthoritativelyUnknownNodes(t *testing.T) {
 	}
 }
 
+func TestRegistrySweepContinuesPastFailedNode(t *testing.T) {
+	app := createTestApp(t)
+	first := registeredRemovalNode(t, app)
+	second := registeredRemovalNode(t, app)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+registry.NodeID(first.ID().Uint64())) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":"removed"}`)
+	}))
+	defer server.Close()
+
+	err := app.refreshRegistryNodes(t.Context(), registry.New(server.URL, "secret"))
+	require.Error(t, err, "the incomplete sweep must remain owed")
+
+	_, firstPresent := app.state.GetNodeByID(first.ID())
+	require.True(t, firstPresent)
+
+	_, secondPresent := app.state.GetNodeByID(second.ID())
+	require.False(t, secondPresent, "one failed lookup must not skip the next removal")
+}
+
+func TestRegistrySweepTimeoutRetainsNode(t *testing.T) {
+	app := createTestApp(t)
+	node := registeredRemovalNode(t, app)
+
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	err := app.refreshRegistryNodes(ctx, registry.New(server.URL, "secret"))
+	require.Error(t, err)
+
+	_, present := app.state.GetNodeByID(node.ID())
+	require.True(t, present, "timeout cannot authorize removal")
+}
+
 func TestRunnerRemovalFailureKeepsCursor(t *testing.T) {
 	runner := newRegistryRunner(nil, newFakeWorldCache(), nil, filepath.Join(t.TempDir(), "cache.json"))
 	cursor := int64(11)
 	runner.cursor = &cursor
 	failure := errTestRegistryDelete
 	runner.remove = func(types.NodeID) error { return failure }
-	require.ErrorIs(t, runner.apply(t.Context(), registry.Change{Kind: "removed", Seq: 12, HeadNodeID: "3", WorldRevision: 8}), failure)
+	require.ErrorIs(t, runner.apply(registry.Change{Kind: "removed", Seq: 12, HeadNodeID: "3", WorldRevision: 8}), failure)
 	require.Equal(t, int64(11), *runner.cursor)
 }
 
-func TestRunnerUnknownKindRefreshesBeforeAdvancing(t *testing.T) {
-	cache := newFakeWorldCache()
-	runner := newRegistryRunner(nil, cache, nil, filepath.Join(t.TempDir(), "cache.json"))
-	refreshed := false
-	runner.refreshNodes = func(context.Context) error { refreshed = true; return nil }
-	require.NoError(t, runner.apply(t.Context(), registry.Change{Kind: "future-kind", Seq: 12, HeadNodeID: "future-shape", WorldRevision: 8}))
-	require.True(t, refreshed)
-	require.Equal(t, []string{"refresh"}, cache.taken())
-	require.Equal(t, int64(12), *runner.cursor)
+func TestRunnerUnusableEventPersistsSweepWithoutInlineRefresh(t *testing.T) {
+	for _, kind := range []string{"future-kind", "world", "removed"} {
+		t.Run(kind, func(t *testing.T) {
+			cache := newFakeWorldCache()
+			path := filepath.Join(t.TempDir(), "cache.json")
+			runner := newRegistryRunner(nil, cache, nil, path)
+			refreshed := false
+			runner.refreshNodes = func(context.Context) error { refreshed = true; return nil }
+			require.NoError(t, runner.apply(registry.Change{Kind: kind, Seq: 12, HeadNodeID: "invalid", WorldRevision: 8}))
+			require.False(t, refreshed)
+			require.Empty(t, cache.taken())
+			require.Equal(t, int64(12), *runner.cursor)
+
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			var saved map[string]any
+			require.NoError(t, json.Unmarshal(data, &saved))
+			require.Equal(t, true, saved["sweep_owed"])
+		})
+	}
 }
 
 // fakeWorldCache records what the runner did to the head's World cache and in
@@ -376,6 +449,43 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 // The ordinary life of the stream: connect, refresh, apply what arrives, and
 // reconnect from the cursor the last event set.
+func TestRunnerSweepFailureDoesNotBlockEventsAndResumeSkipsSweep(t *testing.T) {
+	for _, owed := range []bool{false, true} {
+		t.Run(strconv.FormatBool(owed), func(t *testing.T) {
+			gentility := newFakeGentility(events(registry.Change{Seq: 12, HeadNodeID: "3", WorldRevision: 1}))
+			server := serve(t, gentility)
+			path := filepath.Join(t.TempDir(), "cache.json")
+			cursor := int64(11)
+			require.NoError(t, saveRegistryCache(path, registryCache{Cursor: &cursor, SweepOwed: owed}))
+
+			runner, changes := testRunner(t, server, newFakeWorldCache(), path)
+			attempted := make(chan struct{}, 10)
+			runner.refreshNodes = func(context.Context) error {
+				attempted <- struct{}{}
+				return errTestRegistryDelete
+			}
+			run(t, runner)
+
+			select {
+			case <-changes:
+			case <-time.After(3 * time.Second):
+				t.Fatal("sweep failure blocked event delivery")
+			}
+
+			if owed {
+				require.NotEmpty(t, attempted)
+			} else {
+				require.Empty(t, attempted)
+			}
+
+			waitFor(t, "persisted event cursor and sweep obligation", func() bool {
+				saved, err := loadRegistryCache(path)
+				return err == nil && saved.Cursor != nil && *saved.Cursor == 12 && saved.SweepOwed == owed
+			})
+		})
+	}
+}
+
 func TestRunnerFollowsTheStreamAndResumesFromItsCursor(t *testing.T) {
 	gentility := newFakeGentility(
 		events(

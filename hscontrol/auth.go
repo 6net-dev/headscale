@@ -136,7 +136,7 @@ func (h *Headscale) handleRegister(
 	// logins as they can be done fully sync and we can respond to the node with
 	// the result as it is waiting.
 	if isAuthKey(req) {
-		resp, err := h.handleRegisterWithAuthKey(req, machineKey, opts...)
+		resp, err := h.handleRegisterWithAuthKey(req, machineKey, opts...) //nolint:contextcheck // the registry callbacks run in the node write's transaction, on their own deadline
 		if err != nil {
 			// Preserve HTTPError types so they can be handled properly by the HTTP layer
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {

@@ -36,7 +36,7 @@ func fromComputerListener(req *http.Request) bool {
 // that key, so the nodes with that key are what is checked.
 func (ns *noiseServer) computersOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := ns.admitComputer(r)
+		err := ns.admitComputer(r) //nolint:contextcheck // a World read has a deadline of its own and fills a cache other requests use
 		if err != nil {
 			log.Info().
 				Err(err).

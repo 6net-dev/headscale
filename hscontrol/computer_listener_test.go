@@ -60,12 +60,15 @@ func (g *gentility) world(w http.ResponseWriter, r *http.Request) {
 	case !ok:
 		w.WriteHeader(http.StatusConflict)
 	default:
-		_ = json.NewEncoder(w).Encode(registry.World{
+		err := json.NewEncoder(w).Encode(registry.World{
 			RendererVersion: registry.RendererVersion1,
 			HeadNodeID:      id,
 			Addresses:       []string{"fd00::" + id},
 			Computer:        computer,
 		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 	}
 }
 
@@ -480,7 +483,7 @@ func TestFromComputerListenerReadsPresence(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/ts2021", nil)
 			for _, value := range tt.values {
-				req.Header.Add("x-gentility-computer-listener", value)
+				req.Header.Add("X-Gentility-Computer-Listener", value)
 			}
 
 			assert.Equal(t, tt.want, fromComputerListener(req))

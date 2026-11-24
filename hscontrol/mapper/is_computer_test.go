@@ -73,6 +73,7 @@ func TestIsComputerReadsTheCachedWorld(t *testing.T) {
 	// The registry answers that it is no computer's any more.
 	delete(store.errs, "1")
 	store.worlds["1"] = world("1", "acme", "n1", []string{selfAddr})
+
 	tick.advance(2 * defaultWorldTTL)
 	assert.False(t, b.IsComputer(1))
 }

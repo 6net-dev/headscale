@@ -77,6 +77,26 @@ computing the removed set per recipient at build time — which is what the
 registry rewrite does — and putting it in `tailcfg.MapResponse.PeersRemoved`, a
 different struct that nothing treats as a deletion.
 
+## The computer listener
+
+A proxy can give computers a listener of their own to reach the head on. It
+marks each request there with `X-Gentility-Computer-Listener`, replacing
+whatever the client sent. The head reads the mark on the `/ts2021` upgrade, by
+presence and not by value, and a marked session **may carry only a computer's
+own node**, which the registry is the one to say:
+
+- A machine with no node may only register with a pre-auth key, and the
+  registration goes to the registry with `computer_listener: true`. A key that
+  is not a computer's is refused there (409 `not_a_computer`), so the write
+  rolls back, and the client hears a failed registration.
+- A machine with a node needs the World of every node with its machine key to
+  say `computer: true`. If one does not, or has no World to read, the request
+  gets a 403 before its handler runs, and nothing it carries is stored.
+  A client retries a 403, so a node whose World comes to say so is let in.
+
+The mark only ever refuses. A client that sends it on any other listener asks
+for these refusals and gains nothing.
+
 ## Settings
 
 | Key | Default | What it is |

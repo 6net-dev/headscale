@@ -85,6 +85,9 @@ type noiseServer struct {
 	conn           *controlbase.Conn
 	machineKey     key.MachinePublic
 
+	// computerListener is true for a session from the computer listener.
+	computerListener bool
+
 	// [tailcfg.EarlyNoise]-related stuff
 	challenge       key.ChallengePrivate
 	protocolVersion int
@@ -114,6 +117,8 @@ func (h *Headscale) NoiseUpgradeHandler(
 	ns := noiseServer{
 		headscale: h,
 		challenge: key.NewChallenge(),
+
+		computerListener: fromComputerListener(req),
 	}
 
 	noiseConn, err := controlhttpserver.AcceptHTTP(
@@ -132,11 +137,25 @@ func (h *Headscale) NoiseUpgradeHandler(
 	ns.machineKey = ns.conn.Peer()
 	ns.protocolVersion = ns.conn.ProtocolVersion()
 
-	// This router is served only over the Noise connection, and exposes only the new API.
-	//
-	// The HTTP2 server that exposes this router is created for
-	// a single hijacked connection from /ts2021, using [netutil.NewOneConnListener]
+	ns.httpBaseConfig = &http.Server{
+		Handler:           ns.router(req.RemoteAddr),
+		ReadHeaderTimeout: types.HTTPTimeout,
+	}
+	ns.http2Server = &http2.Server{}
 
+	ns.http2Server.ServeConn(
+		noiseConn,
+		&http2.ServeConnOpts{
+			BaseConfig: ns.httpBaseConfig,
+		},
+	)
+}
+
+// router is served only over the Noise connection, and exposes only the new API.
+//
+// The HTTP2 server that exposes this router is created for
+// a single hijacked connection from /ts2021, using [netutil.NewOneConnListener].
+func (ns *noiseServer) router(remoteAddr string) chi.Router {
 	r := chi.NewRouter()
 
 	// Limit request body size to prevent unauthenticated OOM attacks.
@@ -161,10 +180,14 @@ func (h *Headscale) NoiseUpgradeHandler(
 	// The outer router resolved trusted_proxies on req before the
 	// upgrade; pin that value across the hijack so /machine/* logs the
 	// client IP instead of the reverse proxy's loopback peer.
-	r.Use(overrideRemoteAddr(req.RemoteAddr))
+	r.Use(overrideRemoteAddr(remoteAddr))
 
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
+
+	if ns.computerListener {
+		r.Use(ns.computersOnly)
+	}
 
 	r.Handle("/metrics", metrics.Handler())
 
@@ -210,18 +233,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Post("/c2n", ns.NotImplementedHandler)
 	})
 
-	ns.httpBaseConfig = &http.Server{
-		Handler:           r,
-		ReadHeaderTimeout: types.HTTPTimeout,
-	}
-	ns.http2Server = &http2.Server{}
-
-	ns.http2Server.ServeConn(
-		noiseConn,
-		&http2.ServeConnOpts{
-			BaseConfig: ns.httpBaseConfig,
-		},
-	)
+	return r
 }
 
 func unsupportedClientError(version tailcfg.CapabilityVersion) error {
@@ -763,7 +775,7 @@ func (ns *noiseServer) RegistrationHandler(
 			return &regReq, regErr(err)
 		}
 
-		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer())
+		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.machineKey, ns.registerOptions()...)
 		if err != nil {
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {
 				resp = &tailcfg.RegisterResponse{

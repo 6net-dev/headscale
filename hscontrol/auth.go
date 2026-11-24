@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
@@ -39,6 +40,7 @@ func (h *Headscale) handleRegister(
 	ctx context.Context,
 	req tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
+	opts ...state.RegisterOption,
 ) (*tailcfg.RegisterResponse, error) {
 	// Check for logout/expiry FIRST, before checking auth key.
 	// Tailscale clients may send logout requests with BOTH a past expiry AND an auth key.
@@ -134,7 +136,7 @@ func (h *Headscale) handleRegister(
 	// logins as they can be done fully sync and we can respond to the node with
 	// the result as it is waiting.
 	if isAuthKey(req) {
-		resp, err := h.handleRegisterWithAuthKey(req, machineKey)
+		resp, err := h.handleRegisterWithAuthKey(req, machineKey, opts...) //nolint:contextcheck // the registry callbacks run in the node write's transaction, on their own deadline
 		if err != nil {
 			// Preserve HTTPError types so they can be handled properly by the HTTP layer
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {
@@ -414,10 +416,12 @@ func registrationDataFromRequest(
 func (h *Headscale) handleRegisterWithAuthKey(
 	req tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
+	opts ...state.RegisterOption,
 ) (*tailcfg.RegisterResponse, error) {
 	node, changed, err := h.state.HandleNodeFromPreAuthKey(
 		req,
 		machineKey,
+		opts...,
 	)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

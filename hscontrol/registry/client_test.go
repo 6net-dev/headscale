@@ -239,6 +239,71 @@ func TestRegisterStatuses(t *testing.T) {
 	}
 }
 
+func TestRegisterTellsNotAComputerFromRefused(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{"not a computer's key", `{"error":"not_a_computer"}`, ErrNotAComputer},
+		{"contradicts the record", `{"error":"refused"}`, ErrRefused},
+		{"no body", ``, ErrRefused},
+		{"not json", `<html>Conflict</html>`, ErrRefused},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprint(w, tt.body)
+			})
+
+			_, err := client.Register(t.Context(), Registration{})
+			require.Equal(t, tt.want, err)
+		})
+	}
+}
+
+// An unmarked call's body is what it was before the field existed, and a
+// marked one's field is a JSON true: Gentility refuses any other type.
+func TestRegistrationSaysComputerListenerOnlyWhenMarked(t *testing.T) {
+	unmarked, err := json.Marshal(Registration{HeadNodeID: "3"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"preauth_key_id":"","node_key":"","machine_key":"","head_node_id":"3"}`, string(unmarked))
+
+	marked, err := json.Marshal(Registration{HeadNodeID: "3", ComputerListener: true})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"preauth_key_id":"","node_key":"","machine_key":"","head_node_id":"3","computer_listener":true}`, string(marked))
+}
+
+func TestWorldReadsComputer(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"a computer's own node", `{"renderer_version":1,"computer":true}`, true},
+		{"any other node", `{"renderer_version":1}`, false},
+		{"said to be false", `{"renderer_version":1,"computer":false}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, tt.body)
+			})
+
+			world, err := client.World(t.Context(), "3")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, world.Computer)
+		})
+	}
+
+	// The World cache is written to disk and read back.
+	cached, err := json.Marshal(World{Computer: true})
+	require.NoError(t, err)
+
+	var restored World
+	require.NoError(t, json.Unmarshal(cached, &restored))
+	assert.True(t, restored.Computer)
+}
+
 func TestRotateSendsTheContractBodyAndAcceptsNoContent(t *testing.T) {
 	var got Rotation
 

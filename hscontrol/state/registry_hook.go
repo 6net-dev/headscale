@@ -140,6 +140,11 @@ func (s *State) recordRegistration(
 	nodeID types.NodeID,
 ) (*registry.World, error) {
 	if s.registry == nil || params.PreAuthKey == nil {
+		// Nothing here can say whose key this is.
+		if params.ComputerListener {
+			return nil, errNotAComputer
+		}
+
 		return nil, nil //nolint:nilnil // no registry, no world
 	}
 
@@ -154,6 +159,8 @@ func (s *State) recordRegistration(
 		NodeKey:      params.NodeKey.String(),
 		MachineKey:   params.MachineKey.String(),
 		HeadNodeID:   registry.NodeID(nodeID.Uint64()),
+
+		ComputerListener: params.ComputerListener,
 	})
 	if err != nil {
 		return nil, registrationRefusal(err)
@@ -197,6 +204,8 @@ func registrationRefusal(err error) error {
 		return fmt.Errorf("%w: %w", types.PAKError("authkey expired"), err)
 	case errors.Is(err, registry.ErrRefused):
 		return fmt.Errorf("%w: %w", types.PAKError("registration refused by the registry"), err)
+	case errors.Is(err, registry.ErrNotAComputer):
+		return fmt.Errorf("%w: %w", errNotAComputer, err)
 	case errors.Is(err, registry.ErrCompromised):
 		return fmt.Errorf("%w: %w", types.PAKError("authkey is bound to a different machine"), err)
 	default:

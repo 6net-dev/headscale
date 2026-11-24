@@ -103,6 +103,10 @@ var (
 	// retries it.
 	ErrRefused = errors.New("registry: refused")
 
+	// ErrNotAComputer: a register 409 that says so. The session came from the
+	// computer listener and the pre-auth key is not a computer's own.
+	ErrNotAComputer = errors.New("registry: not a computer's key")
+
 	// ErrExpired: 410 on register. The pre-auth key is past its ten minutes.
 	ErrExpired = errors.New("registry: pre-auth key expired")
 
@@ -269,6 +273,15 @@ func (c *Client) Register(ctx context.Context, reg Registration) (*RegistrationR
 	case http.StatusForbidden:
 		return nil, ErrCompromised
 	case http.StatusConflict:
+		var refusal struct {
+			Error string `json:"error"`
+		}
+
+		err := decodeDocument(resp, &refusal)
+		if err == nil && refusal.Error == "not_a_computer" {
+			return nil, ErrNotAComputer
+		}
+
 		return nil, ErrRefused
 	default:
 		return nil, c.common(resp, "register")

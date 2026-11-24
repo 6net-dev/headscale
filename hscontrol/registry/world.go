@@ -64,6 +64,11 @@ type World struct {
 	// Nothing downstream can tell the two apart, but a cache that does not
 	// round-trip exactly is a cache nobody can compare against the wire.
 	DERPMap json.RawMessage `json:"derp_map,omitempty"`
+
+	// Computer is true on the World of a computer's own node and absent
+	// from every other. It is the only node a session from the computer
+	// listener may carry; see [Registration.ComputerListener].
+	Computer bool `json:"computer,omitempty"`
 }
 
 // RendererVersion1 is the only World shape this head understands.
@@ -137,6 +142,12 @@ type Registration struct {
 	NodeKey      string `json:"node_key"`
 	MachineKey   string `json:"machine_key"`
 	HeadNodeID   string `json:"head_node_id"`
+
+	// ComputerListener is true when the registration arrived on a session
+	// from the computer listener, and absent otherwise. Gentility then
+	// accepts only a key that is a computer's own, and answers any other
+	// with [ErrNotAComputer].
+	ComputerListener bool `json:"computer_listener,omitempty"`
 }
 
 // RegistrationResult is what Gentility records for a registration.

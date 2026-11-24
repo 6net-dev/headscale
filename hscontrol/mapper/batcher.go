@@ -81,6 +81,19 @@ func (b *Batcher) SeedWorld(nodeID types.NodeID, world *registry.World) {
 	b.mapper.cacheWorld(nodeID, world)
 }
 
+// IsComputer says whether a node's World says it is a computer's own. It reads
+// the World as a peer's is read, cached first, and answers false when there is
+// none to read.
+func (b *Batcher) IsComputer(nodeID types.NodeID) bool {
+	if b.mapper == nil || b.mapper.regClient == nil {
+		return false
+	}
+
+	world, _ := b.mapper.peerWorld(nodeID)
+
+	return world != nil && world.Computer
+}
+
 // RefreshWorlds opens a new refresh generation and reads every cached World
 // again. The change-stream runner calls it on each (re)connect, before it
 // serves an event: a reconnect is the window in which the head may have missed

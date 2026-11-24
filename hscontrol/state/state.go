@@ -1573,6 +1573,9 @@ type newNodeParams struct {
 	// Optional: Pre-auth key specific fields
 	PreAuthKey *types.PreAuthKey
 
+	// Optional: the registration came from the computer listener
+	ComputerListener bool
+
 	// Optional: Existing node for netinfo preservation
 	ExistingNodeForNetinfo types.NodeView
 }
@@ -2432,7 +2435,10 @@ func (s *State) findExistingNodeForPAK(
 func (s *State) HandleNodeFromPreAuthKey(
 	regReq tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
+	opts ...RegisterOption,
 ) (types.NodeView, change.Change, error) {
+	options := newRegisterOptions(opts)
+
 	// Serialise registration for this machine so concurrent restarts resolve
 	// to a single node rather than racing the find-then-create section.
 	defer s.lockRegistration(machineKey)()
@@ -2454,6 +2460,10 @@ func (s *State) HandleNodeFromPreAuthKey(
 	existingNodeSameUser, existsSameUser, err := s.findExistingNodeForPAK(machineKey, pak)
 	if err != nil {
 		return types.NodeView{}, change.Change{}, err
+	}
+
+	if existsSameUser && options.refuses(existingNodeSameUser) {
+		return types.NodeView{}, change.Change{}, errNotAComputer
 	}
 
 	// For existing nodes, skip validation if:
@@ -2821,6 +2831,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Expiry:                 reqExpiry,
 			RegisterMethod:         util.RegisterMethodAuthKey,
 			PreAuthKey:             pak,
+			ComputerListener:       options.computerListener(),
 			ExistingNodeForNetinfo: cmp.Or(differentUserNode, types.NodeView{}),
 		})
 		if err != nil {
